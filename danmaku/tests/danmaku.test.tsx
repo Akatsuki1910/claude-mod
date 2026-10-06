@@ -15,22 +15,41 @@ import {
   frameRows,
   ingest,
   replaceModel,
+  sanitize,
   stepClock,
   textWidth,
   tick,
 } from '../hooks/layout'
 import type { ScreenConfig, ScreenState } from '../hooks/layout'
+import * as lines from '../hooks/lines'
 import {
+  AFTER_ERROR_LINES,
   BASH_SPECIAL,
   COLORS,
+  COMBO_BY_GROUP,
+  COMBO_LINES,
   DEMO,
   DENIED_LINES,
+  ELAPSED_LINES,
   ERROR_LINES,
+  ERROR_STREAK_LINES,
+  FILE_KINDS,
+  LONG_PROMPT_LINES,
+  MILESTONE_LINES,
+  NO_TOOLS_LINES,
   OTSU_LINES,
+  PROMPT_TOPICS,
+  SHORT_PROMPT_LINES,
+  THINKING_LINES,
+  TIME_LINES,
+  TOUGH_TURN_LINES,
+  ambient,
   parseUserComment,
+  reactToPrompt,
   reactToToolEnd,
+  reactToTurnEnd,
 } from '../hooks/lines'
-import type { Draft } from '../hooks/lines'
+import type { Draft, Line } from '../hooks/lines'
 
 const SURFACES = ['terminal', 'desktop'] as const
 
@@ -75,7 +94,14 @@ const colOf = (row: string, text: string): number => {
   return i < 0 ? -1 : textWidth(row.slice(0, i))
 }
 
-const texts = (lines: ReadonlyArray<string | Draft>): string[] => lines.map(l => (typeof l === 'string' ? l : l.text))
+const texts = (list: ReadonlyArray<string | Draft>): string[] => list.map(l => (typeof l === 'string' ? l : l.text))
+
+/** 置き換え文字（{n} など）を埋めた本文 */
+const filled = (list: ReadonlyArray<string | Draft>, vars: Record<string, string>): string[] =>
+  texts(list).map(t => t.replace(/\{(\w+)\}/g, (_, key: string) => vars[key] ?? ''))
+
+const runCommand = ($: Engine, args: string) =>
+  $.command.run({ command: 'danmaku', args, origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 80 } })
 
 function band(isWorking: boolean, bodyColumns = 60) {
   return {
@@ -103,6 +129,53 @@ async function onAir($: Engine): Promise<DanmakuComment[]> {
   const client = await ui.find({ type: 'Client' })
   await ui.unmount()
   return (client?.props.props as ScreenProps | undefined)?.comments ?? []
+}
+
+/** 前に読んだ分を除いて、新しく帯に渡ったコメントを返す関数を作る */
+function freshOnAir($: Engine): () => Promise<string[]> {
+  const seen = new Set<number>()
+  return async () => {
+    const out: string[] = []
+    for (const c of await onAir($)) {
+      if (seen.has(c.id)) continue
+      seen.add(c.id)
+      out.push(c.text)
+    }
+    return out
+  }
+}
+
+/** {n} にありそうな回数を入れた本文すべて */
+const anyN = (list: readonly Line[]) => [1, 2, 3, 5, 8, 9, 10, 11, 12, 20].flatMap(n => filled(list, { n: String(n), tool: 'Read' }))
+const ALL_COMBOS = [...anyN(COMBO_LINES), ...anyN(COMBO_BY_GROUP.Read ?? [])]
+const ALL_MILESTONES = anyN(MILESTONE_LINES)
+const ALL_STREAKS = anyN(ERROR_STREAK_LINES)
+
+/**
+ * スリープ明けのように時刻だけが飛ぶ時計。clock.every の1周期は tick() を呼んだときだけ進む
+ * （mock.clock は飛ばした分の周期を全部鳴らすので、節目を飛ばす場面を作れない）
+ */
+function sleepyClock(on: On) {
+  let now = 1_000_000
+  let due: Array<() => void> = []
+  on('clock.now', () => ({ value: now }))
+  on('clock.after', () => ({ value: undefined }))
+  on('clock.every', () => new Promise(resolve => due.push(() => resolve({ value: undefined }))))
+  on('ui.render', ($, e) => {
+    const { Box } = $.ui.resolve(e)
+    return <Box key="engine" />
+  })
+  return {
+    jump: (ms: number) => {
+      now += ms
+    },
+    tick: async () => {
+      const ready = due
+      due = []
+      for (const resolve of ready) resolve()
+      await new Promise(r => setTimeout(r, 20))
+    },
+  }
 }
 
 const cfg: ScreenConfig = { cols: 40, lanes: 3, durationMs: 4000, fixedMs: 3000 }
@@ -390,6 +463,112 @@ describe('lines', () => {
     const denied = reactToToolEnd('Edit', {}, { isError: false, isDenied: true }, r)
     expect(texts(DENIED_LINES)).toContain(denied[0]!.text)
   })
+  test('ネタ帳はどれも空でなく、短く、描けない文字や置き換え忘れがない', () => {
+    const vars = { file: 'login.test.ts', cmd: 'npm run build', q: 'TODO', tool: 'Read', n: '12', min: '10' }
+    const pools: Array<[string, readonly Line[]]> = []
+    const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null
+    for (const [name, value] of Object.entries(lines)) {
+      const head: unknown = Array.isArray(value) ? value[0] : undefined
+      if (typeof head === 'string' || (isObject(head) && 'text' in head)) pools.push([name, value as Line[]])
+      else if (isObject(head) && 're' in head) {
+        ;(value as Array<{ re: RegExp; lines?: Line[]; start?: Line[]; ok?: Line[]; ng?: Line[] }>).forEach((entry, i) => {
+          expect(entry.re.global || entry.re.sticky).toBe(false)
+          for (const key of ['lines', 'start', 'ok', 'ng'] as const) {
+            const list = entry[key]
+            if (list !== undefined) pools.push([`${name}[${i}].${key}`, list])
+          }
+        })
+      } else if (isObject(value) && !Array.isArray(value) && name !== 'COLORS') {
+        for (const [key, list] of Object.entries(value)) pools.push([`${name}.${key}`, list as Line[]])
+      }
+    }
+    expect(pools.length).toBeGreaterThan(60)
+    const colors = new Set(Object.values(COLORS))
+    const all = new Set<string>()
+    for (const [name, list] of pools) {
+      expect([name, list.length > 0]).toEqual([name, true])
+      const seen = new Set<string>()
+      for (const line of list) {
+        const d: Draft = typeof line === 'string' ? { text: line } : line
+        const [text] = filled([d], vars)
+        all.add(d.text)
+        // 同じネタ帳に同じコメントは2つ置かない
+        expect([name, d.text, seen.has(d.text)]).toEqual([name, d.text, false])
+        seen.add(d.text)
+        expect([name, text, sanitize(text!) === text]).toEqual([name, text, true])
+        expect([name, text, textWidth(text!) <= 32]).toEqual([name, text, true])
+        expect([name, text, /[{}]/.test(text!)]).toEqual([name, text, false])
+        // 絵文字は端末によって幅が変わるので使わない
+        expect([name, text, [...text!].some(ch => (ch.codePointAt(0) ?? 0) >= 0x1f000)]).toEqual([name, text, false])
+        if (d.color !== undefined) expect(colors.has(d.color)).toBe(true)
+        if (d.pos !== undefined && d.pos !== 'naka') expect(['DEMO', 'OTSU_BANNERS']).toContain(name)
+      }
+    }
+    // 種類を増やした分が減っていないか
+    expect(all.size).toBeGreaterThan(800)
+  })
+
+  test('Bash のコマンドとファイル名で反応が変わる', () => {
+    const startOf = (command: string) => texts(BASH_SPECIAL.find(s => s.re.test(command))?.start ?? [])
+    const okOf = (command: string) => texts(BASH_SPECIAL.find(s => s.re.test(command))?.ok ?? [])
+    expect(startOf('rm -rf node_modules')).toContain('ヒエッ')
+    expect(startOf('git push --force origin main')).toContain('勇者現る')
+    expect(startOf('git push origin main')).toContain('プッシュ！')
+    expect(startOf('git push origin main')).not.toContain('勇者現る')
+    for (const command of ['npm test', 'npx vitest run', 'pytest -q', 'go test ./...', 'claude plugin test ./danmaku']) {
+      expect([command, okOf(command).includes('8888888888')]).toEqual([command, true])
+    }
+    expect(startOf('npm run build')).toContain('ビルド待機')
+    for (const command of ['git rebase main', 'git status', 'npm install', 'docker compose up', 'cat README.md', 'ls -la']) {
+      expect([command, startOf(command).length > 0]).toEqual([command, true])
+    }
+    const kindOf = (name: string) => FILE_KINDS.findIndex(k => k.re.test(name))
+    for (const name of ['login.test.ts', 'package.json', 'README.md', 'Dockerfile', 'main.py', 'style.css', '.env', 'App.tsx']) {
+      expect([name, kindOf(name) >= 0]).toEqual([name, true])
+    }
+    expect(kindOf('login.test.ts')).not.toBe(kindOf('login.ts'))
+  })
+
+  test('プロンプトの長さや時間帯にも反応する', () => {
+    const r = () => 0
+    const lateNight = reactToPrompt('ログインのバグを直して', r, 2).map(d => d.text)
+    expect(lateNight.some(t => texts(TIME_LINES.lateNight).includes(t))).toBe(true)
+    const morning = reactToPrompt('ログインのバグを直して', r, 7).map(d => d.text)
+    expect(morning.some(t => texts(TIME_LINES.morning).includes(t))).toBe(true)
+    // 時間帯のあいさつは、ときどきだけ
+    expect(reactToPrompt('ログインのバグを直して', () => 0.99, 7).some(d => texts(TIME_LINES.morning).includes(d.text))).toBe(false)
+    expect(reactToPrompt('直して', r).some(d => texts(SHORT_PROMPT_LINES).includes(d.text))).toBe(true)
+    expect(reactToPrompt('仕様'.repeat(101), r).some(d => texts(LONG_PROMPT_LINES).includes(d.text))).toBe(true)
+  })
+
+  test('ターンの終わり方と、作業中のつぶやきの様子で反応が変わる', () => {
+    const half = () => 0.5
+    const quiet = reactToTurnEnd({ reason: 'answer', durationMs: 20_000, tools: 0, errors: 3 }, half).map(d => d.text)
+    expect(quiet.some(t => texts(NO_TOOLS_LINES).includes(t))).toBe(true)
+    expect(quiet.some(t => texts(TOUGH_TURN_LINES).includes(t))).toBe(true)
+    expect(quiet.some(t => texts(OTSU_LINES).includes(t))).toBe(true)
+    const r = () => 0
+    const base = { elapsedMs: 10_000, tools: 3, isErrorRecent: false, isBusy: false }
+    expect(texts(AFTER_ERROR_LINES)).toContain(ambient(r, { ...base, isErrorRecent: true })[0]!.text)
+    expect(texts(THINKING_LINES)).toContain(ambient(r, { ...base, tools: 0 })[0]!.text)
+    expect(ambient(r)).toHaveLength(1)
+  })
+
+  test('ツールの種類ごとのネタ帳は toolGroup の名前で引け、成功したツールにはほめ言葉がある', () => {
+    const tools = ['Read', 'Edit', 'Write', 'Bash', 'Grep', 'WebFetch', 'Agent', 'TodoWrite', 'AskUserQuestion', 'ExitPlanMode', 'Skill', 'mcp__x__y', 'Zzz']
+    const groups = new Set(tools.map(lines.toolGroup))
+    const tables = [
+      ['TOOL_LINES', lines.TOOL_LINES],
+      ['TOOL_OK_LINES', lines.TOOL_OK_LINES],
+      ['COMBO_BY_GROUP', COMBO_BY_GROUP],
+    ] as const
+    for (const [name, table] of tables) {
+      for (const key of Object.keys(table)) expect([name, key, groups.has(key)]).toEqual([name, key, true])
+    }
+    const ok = lines.reactToToolOk('Read', { file_path: '/a/b.ts' }, () => 0)
+    expect(ok).toHaveLength(1)
+    expect(filled(lines.TOOL_OK_LINES.Read ?? [], { file: 'b.ts' })).toContain(ok[0]!.text)
+  })
 })
 
 describe('band', () => {
@@ -566,7 +745,9 @@ describe('events', () => {
     const value = await onAir($)
     const said = value.map(c => c.text)
     expect(said).toContain('【お題】ログインのバグを直して')
-    expect(said.some(t => ['バグ回きた', 'デバッグ回', '原因なんやろ'].includes(t))).toBe(true)
+    const topics = PROMPT_TOPICS.filter(t => t.re.test('ログインのバグを直して'))
+    expect(topics.some(t => texts(t.lines).includes('バグ回きた'))).toBe(true)
+    expect(said.some(t => topics.some(topic => texts(topic.lines).includes(t)))).toBe(true)
   })
 
   test('ターンが終わるとおつが流れる。サブエージェントのターンでは流さない', async ($, on) => {
@@ -591,5 +772,180 @@ describe('events', () => {
     const said = value.map(c => c.text)
     expect(said).toContain('ログイン直ってて草')
     expect(said).toContain('有能')
+  })
+  // 静かになってから QUIET_MS（の 0.75〜1.25 倍）たった次の見回り（250ms ごと）でつぶやく
+  for (const [density, min, max] of [
+    ['low', 3500, 5750],
+    ['normal', 2000, 3250],
+    ['high', 1000, 1500],
+  ] as const) {
+    test(`作業中は静かになっても途切れず、density ${density} ではつぶやきの間隔が ${min}〜${max}ms`, { options: { density } }, async ($, on) => {
+      const clock = world(on)
+      on('turn.start', (_$, e) => ({ turnId: e.turnId }))
+      await $.turn.start({ text: '調べて', turnId: 't1' })
+      const ats = new Set<number>()
+      for (let t = 0; t < 40_000; t += 1000) {
+        await clock.advance(1000)
+        for (const c of await onAir($)) ats.add(c.at)
+      }
+      const sorted = [...ats].sort((a, b) => a - b)
+      expect(sorted.length).toBeGreaterThan(40_000 / max - 1)
+      for (let k = 1; k < sorted.length; k++) {
+        expect(sorted[k]! - sorted[k - 1]!).toBeGreaterThanOrEqual(min)
+        expect(sorted[k]! - sorted[k - 1]!).toBeLessThanOrEqual(max)
+      }
+    })
+  }
+
+  test('作業が1分を超えると経過時間を言い、ターンが終わるとつぶやきは止まる', async ($, on) => {
+    const clock = world(on)
+    on('turn.start', (_$, e) => ({ turnId: e.turnId }))
+    on('turn.complete', (_$, e) => ({ text: e.answer }))
+    await $.turn.start({ text: '調べて', turnId: 't1' })
+    await clock.advance(60_500)
+    const said = (await onAir($)).map(c => c.text)
+    expect(said.some(t => filled(ELAPSED_LINES, { min: '1' }).includes(t))).toBe(true)
+    await $.turn.complete({ answer: 'done', durationMs: 60_500, isAborted: false, turnId: 't1', reason: 'answer' })
+    await clock.advance(20_000)
+    expect(await onAir($)).toHaveLength(0)
+  })
+
+  test('同じツールが続くと連発に、ツールの回数が節目に来るとコンボに反応する', { options: { density: 'high' } }, async ($, on) => {
+    const clock = world(on)
+    on('tool.call', () => ({ result: 'ok', text: 'ok' }))
+    const said: string[] = []
+    for (let i = 1; i <= 10; i++) {
+      await $.tool.call({ tool: 'Read', file_path: `/src/file${i}.ts` })
+      if (i === 3 || i === 10) said.push(...(await onAir($)).map(c => c.text))
+      await clock.advance(1000)
+    }
+    const combos = [...filled(COMBO_LINES, { n: '3', tool: 'Read' }), ...filled(COMBO_BY_GROUP.Read ?? [], { n: '3', tool: 'Read' })]
+    expect(said.some(t => combos.includes(t))).toBe(true)
+    expect(said.some(t => filled(MILESTONE_LINES, { n: '10' }).includes(t))).toBe(true)
+  })
+
+  test('続けて失敗すると、連続エラーに反応する', async ($, on) => {
+    world(on)
+    on('tool.call', () => ({ isError: true as const, result: 'x', text: 'x' }))
+    await $.tool.call({ tool: 'Read', file_path: '/a/missing.ts' })
+    await $.tool.call({ tool: 'Read', file_path: '/a/missing2.ts' })
+    const said = (await onAir($)).map(c => c.text)
+    expect(said.some(t => filled(ERROR_STREAK_LINES, { n: '2' }).includes(t))).toBe(true)
+  })
+
+  test('/danmaku demo は何回かに分けて全部流れる', async ($, on) => {
+    const clock = world(on)
+    await runCommand($, 'demo')
+    const seen = new Set((await onAir($)).map(c => c.text))
+    expect(seen.size).toBeLessThan(DEMO.length)
+    for (let t = 0; t < DEMO.length * 300; t += 500) {
+      await clock.advance(500)
+      for (const c of await onAir($)) seen.add(c.text)
+    }
+    expect([...seen].sort()).toEqual(texts(DEMO).sort())
+  })
+  test('スリープ明けで経過時間の節目をいくつも飛ばしたら、いちばん新しいものだけ1回言う', async ($, on) => {
+    const clock = sleepyClock(on)
+    mock.store(on)
+    on('turn.start', (_$, e) => ({ turnId: e.turnId }))
+    await $.turn.start({ text: '調べて', turnId: 't1' })
+    clock.jump(6 * 60_000)
+    await clock.tick()
+    await clock.tick()
+    await clock.tick()
+    const said = (await onAir($)).map(c => c.text)
+    expect(said.filter(t => filled(ELAPSED_LINES, { min: '5' }).includes(t))).toHaveLength(1)
+    for (const min of ['1', '3']) expect(said.some(t => filled(ELAPSED_LINES, { min }).includes(t))).toBe(false)
+  })
+
+  test('サブエージェントのツール呼び出しは、連発・節目・ターンのツール数に数えない', { options: { density: 'high' } }, async ($, on) => {
+    const clock = world(on)
+    on('tool.call', () => ({ result: 'ok', text: 'ok' }))
+    on('turn.complete', (_$, e) => ({ text: e.answer }))
+    const fresh = freshOnAir($)
+    const said: string[] = []
+    for (let i = 1; i <= 15; i++) {
+      await $.tool.call({ tool: 'Read', file_path: `/src/file${i}.ts`, agentId: 'a1' })
+      said.push(...(await fresh()))
+      await clock.advance(2000)
+    }
+    expect(said.filter(t => ALL_COMBOS.includes(t) || ALL_MILESTONES.includes(t))).toEqual([])
+    await $.turn.complete({ answer: 'done', durationMs: 20_000, isAborted: false, turnId: 't1', reason: 'answer' })
+    const end = await fresh()
+    expect(end.some(t => texts(NO_TOOLS_LINES).includes(t))).toBe(true)
+    expect(end.some(t => texts(lines.MANY_TOOLS_LINES).includes(t))).toBe(false)
+  })
+
+  test('新しいターンでは、連発・ツール数・連続エラーを数え直す', { options: { density: 'high' } }, async ($, on) => {
+    const clock = world(on)
+    on('turn.start', (_$, e) => ({ turnId: e.turnId }))
+    on('turn.complete', (_$, e) => ({ text: e.answer }))
+    on('tool.call', (_$, e) =>
+      String((e as { file_path?: unknown }).file_path).includes('ng')
+        ? { isError: true as const, result: 'x', text: 'x' }
+        : { result: 'ok', text: 'ok' },
+    )
+    const fresh = freshOnAir($)
+    await $.turn.start({ text: '調べて', turnId: 't1' })
+    for (const name of ['a', 'b', 'c', 'd', 'e', 'f', 'ng1']) await $.tool.call({ tool: 'Read', file_path: `/src/${name}.ts` })
+    await $.turn.complete({ answer: 'done', durationMs: 20_000, isAborted: false, turnId: 't1', reason: 'answer' })
+    await clock.advance(10_000)
+    await fresh()
+    // 数え直していなければ、2ターン目の1回目で8連発・2連続エラー、3回目で10回の節目になる
+    await $.turn.start({ text: '続けて', turnId: 't2' })
+    await $.tool.call({ tool: 'Read', file_path: '/src/ng2.ts' })
+    expect((await fresh()).filter(t => ALL_COMBOS.includes(t) || ALL_STREAKS.includes(t))).toEqual([])
+    await $.tool.call({ tool: 'Read', file_path: '/src/g.ts' })
+    await $.tool.call({ tool: 'Read', file_path: '/src/h.ts' })
+    const third = await fresh()
+    const combo3 = [...filled(COMBO_LINES, { n: '3', tool: 'Read' }), ...filled(COMBO_BY_GROUP.Read ?? [], { n: '3', tool: 'Read' })]
+    expect(third.some(t => combo3.includes(t))).toBe(true)
+    expect(third.filter(t => ALL_MILESTONES.includes(t))).toEqual([])
+  })
+
+  test('連続エラーは成功で途切れ、拒否では途切れない', async ($, on) => {
+    const clock = world(on)
+    on('tool.call', (_$, e) => {
+      const path = String((e as { file_path?: unknown }).file_path)
+      if (path.includes('deny')) return { deny: 'no' }
+      if (path.includes('ng')) return { isError: true as const, result: 'x', text: 'x' }
+      return { result: 'ok', text: 'ok' }
+    })
+    const fresh = freshOnAir($)
+    const call = async (name: string) => {
+      await $.tool.call({ tool: 'Read', file_path: `/a/${name}.ts` })
+      const out = await fresh()
+      await clock.advance(2000)
+      return out
+    }
+    await call('ng1')
+    await call('ok')
+    expect((await call('ng2')).filter(t => ALL_STREAKS.includes(t))).toEqual([])
+    await call('deny')
+    expect((await call('ng3')).some(t => filled(ERROR_STREAK_LINES, { n: '2' }).includes(t))).toBe(true)
+  })
+
+  test('長くて苦戦したターンのあとでも、AI視聴者のコメントは流量の上限で落ちない', { options: { aiViewers: true } }, async ($, on) => {
+    const clock = world(on)
+    const usage = { input_tokens: 10, output_tokens: 10, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
+    on('model.complete', () => ({ value: { isAnswered: true as const, text: 'ログイン直ってて草\nAI視聴者その2', usage } }))
+    on('turn.start', (_$, e) => ({ turnId: e.turnId }))
+    on('turn.complete', (_$, e) => ({ text: e.answer }))
+    on('tool.call', (_$, e) =>
+      String((e as { file_path?: unknown }).file_path).includes('ng')
+        ? { isError: true as const, result: 'x', text: 'x' }
+        : { result: 'ok', text: 'ok' },
+    )
+    await $.turn.start({ text: '直して', turnId: 't1' })
+    for (let i = 0; i < 15; i++) await $.tool.call({ tool: 'Read', file_path: i % 5 === 0 ? `/src/ng${i}.ts` : `/src/f${i}.ts` })
+    await clock.advance(5000)
+    // 4分・ツール15回・エラー3回: 長丁場 + 働きすぎ + 苦戦 + おつ4 (+ ときどき上のバナー) = 7〜8件
+    await $.turn.complete({ answer: 'ログインのバグを直しました', durationMs: 4 * 60_000, isAborted: false, turnId: 't1', reason: 'answer' })
+    await clock.advance(1500)
+    const said = (await onAir($)).map(c => c.text)
+    expect(said).toContain('ログイン直ってて草')
+    expect(said).toContain('AI視聴者その2')
+    expect(said.some(t => texts(lines.LONG_TURN_LINES).includes(t))).toBe(true)
+    expect(said.some(t => texts(TOUGH_TURN_LINES).includes(t))).toBe(true)
   })
 })
