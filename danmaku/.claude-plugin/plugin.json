@@ -1,0 +1,47 @@
+{
+  "name": "danmaku",
+  "version": "0.1.0",
+  "description": "Claudeの作業に合わせて、プロンプトの上にニコニコ風の弾幕コメントを流す",
+  "author": {
+    "name": "akatsuki1910"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "lanes": {
+      "type": "number",
+      "title": "弾幕の行数",
+      "description": "プロンプトの上で弾幕が流れる行数（1〜5）",
+      "default": 3,
+      "min": 1,
+      "max": 5
+    },
+    "speed": {
+      "type": "string",
+      "title": "流れる速さ",
+      "description": "slow / normal / fast",
+      "default": "normal",
+      "options": [
+        "slow",
+        "normal",
+        "fast"
+      ]
+    },
+    "density": {
+      "type": "string",
+      "title": "コメントの量",
+      "description": "low（控えめ） / normal / high（弾幕）",
+      "default": "normal",
+      "options": [
+        "low",
+        "normal",
+        "high"
+      ]
+    },
+    "aiViewers": {
+      "type": "boolean",
+      "title": "AI視聴者",
+      "description": "ターン終了時、Haiku が Claude の回答を読んで反応コメントを流す（1ターンにつき小さな API 呼び出し1回）",
+      "default": false
+    }
+  }
+}

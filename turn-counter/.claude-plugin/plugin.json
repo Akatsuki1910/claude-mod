@@ -1,0 +1,7 @@
+{
+  "name": "turn-counter",
+  "version": "0.1.0",
+  "description": "ターン数をプロンプト欄の上に表示する",
+  "author": { "name": "akatsuki1910" },
+  "types": "./types/index.d.ts"
+}

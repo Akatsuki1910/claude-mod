@@ -1,0 +1,102 @@
+# danmaku（ニコニコ風 弾幕）
+
+Claude が作業している間、プロンプトの上にニコニコ動画みたいなコメントが右から左へ流れる mod です。
+ファイルを読めば「熟読ニキ」、エラーが出れば「草」、テストが通れば「8888888888」、ターンが終われば「おつ」。
+
+```
+                     【お題】ログインのバグを直して                         [-]
+                                          お題きた     原因なんやろ
+                                            初見
+──────────────────────────────────────────────────────────────────────────────
+❯
+```
+
+- トークンは使いません（AI視聴者をオンにしたときだけ、1ターンに小さな Haiku 呼び出しが1回）
+- 作業中と、コメントが流れている間だけ帯が出ます。終わって数秒でたたまれます
+- ターミナルで動作確認済み。Desktop の Code タブも描画に対応しています（テストのみで確認、実機は未確認）
+
+## 使い方
+
+```sh
+# このフォルダを読み込んで起動
+claude --plugin-dir ./danmaku
+
+# マーケットプレイス（このリポジトリ）から入れる場合
+claude plugin marketplace add /path/to/claude-mod
+claude plugin install danmaku@my-mods
+```
+
+起動したら `/danmaku demo` で試し流しができます。
+
+| コマンド | 内容 |
+| --- | --- |
+| `/danmaku <コメント>` | 自分でコメントを流す。Claude の作業中でもすぐ流れます |
+| `/danmaku red ue 神回` | 先頭にコマンドを付けられる。色: `white red pink orange yellow green cyan blue purple`、位置: `ue`（上に固定）`shita`（下に固定）`naka`（流れる）、`big`（太字） |
+| `/danmaku demo` | お試しの弾幕 |
+| `/danmaku off` / `on` | 止める / 再開する（次のセッションにも引き継ぎます） |
+| `/danmaku` | 今の設定と使い方 |
+
+## 何に反応するか
+
+| きっかけ | 流れるコメントの例 |
+| --- | --- |
+| プロンプト送信 | 上に固定で `【お題】…`、`わこつ` `wktk`。「バグ」「テスト」などの言葉にも反応 |
+| Read / Edit / Write | `熟読ニキ` `神編集` `foo.ts 爆誕` |
+| Bash | `$ npm test` `コマンド職人`。`rm -rf` なら `ヒエッ`、`git push --force` なら `勇者現る` |
+| テスト・ビルドの結果 | 通れば `8888888888` `緑！`、落ちれば `テスト落ちてて草` `赤い…` |
+| エラー / 権限で拒否 | `草` `大草原` `エラー芸` / `拒否られてて草` |
+| サブエージェント | `影分身の術` `部下に投げたｗ` |
+| しばらく静か | `考え中…` `かわいい` `弾幕薄いよ！` |
+| ターン終了 | `おつ` `8888888` `神回`。長いと `長丁場おつ`、中断すると `放送事故` |
+
+## 設定
+
+| 項目 | 値 | 既定 |
+| --- | --- | --- |
+| `lanes` | 弾幕の行数 1〜5 | 3 |
+| `speed` | `slow` / `normal` / `fast` | normal |
+| `density` | `low` / `normal` / `high`（ツール呼び出しにコメントが付く割合） | normal |
+| `aiViewers` | `true` にすると、ターン終了時に Haiku が Claude の回答を読んで、その内容に反応したコメントを流す | false |
+
+マーケットプレイスから入れた場合は `/plugin configure danmaku@my-mods` か `/config` で変えられます。
+`--plugin-dir` で読み込んでいる場合は `~/.claude/settings.json` に書きます:
+
+```json
+{
+  "pluginConfigs": {
+    "danmaku": { "options": { "lanes": 2, "speed": "fast", "density": "high", "aiViewers": true } }
+  }
+}
+```
+
+## 中身
+
+```
+danmaku/
+├── .claude-plugin/plugin.json   マニフェストと設定項目
+├── hooks/
+│   ├── hooks.json
+│   ├── register.tsx             イベントを拾ってコメントを $.state に積む／帯に Client を置く
+│   ├── screen.tsx               Client（描画スレッド）。自分の時計で流す（ターミナルは 20fps、Desktop は約 60fps で小数のセル位置に置く）
+│   ├── layout.ts                全角幅の計算、行の割り当て（追い越し・重なり防止）、1行の合成
+│   └── lines.ts                 コメントのネタ帳。ここを書き換えれば好きなノリにできます
+├── types/index.d.ts             $.state の型
+└── tests/danmaku.test.tsx       claude plugin test で走るテスト
+```
+
+流れ方はニコニコと同じで、どのコメントも同じ時間で画面を横切ります（長いコメントほど速い）。
+同じ行では前のコメントに追いつかないときだけ流し、入る行がなければ少し待ちます。4秒待っても入れないコメントは捨てます（ターミナルでは重ねると読めなくなるため）。
+
+## うまく動かないとき
+
+- `Unknown command: /danmaku` と出る: mod が読み込まれていません。`claude --debug-file /tmp/cc.log --plugin-dir ./danmaku` で起動して、`/tmp/cc.log` の `hooks module danmaku` の行に理由が出ます
+- Claude Code 2.1.285〜2.1.289 で動作確認しています。2.1.286 以前は mod が早期アクセスなので、読み込まれない場合は `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1` を付けて起動するか、`claude update` で 2.1.287 以降にしてください
+- ほかの mod も帯（プロンプトの上）に描いている場合、先に読み込まれた方が帯を丸ごと置き換えることがあります。`--plugin-dir ./danmaku` を先に書くと両方出ます
+
+## 開発
+
+```sh
+claude plugin validate ./danmaku
+claude plugin test ./danmaku
+tsc -p ./danmaku   # 一度読み込むと .claude-plugin/types/ に型が置かれる
+```

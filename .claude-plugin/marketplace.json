@@ -1,0 +1,17 @@
+{
+  "name": "my-mods",
+  "description": "aktk1910's mods for claude",
+  "owner": {
+    "name": "akatsuki1910"
+  },
+  "plugins": [
+    {
+      "name": "turn-counter",
+      "source": "./turn-counter"
+    },
+    {
+      "name": "danmaku",
+      "source": "./danmaku"
+    }
+  ]
+}
