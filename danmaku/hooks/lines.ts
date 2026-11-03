@@ -3,8 +3,11 @@
 
 import type { DanmakuPos } from '../types'
 
-/** これから流すコメントの下書き */
-export type Draft = { text: string; color?: string | null; pos?: DanmakuPos; isBig?: boolean }
+/**
+ * これから流すコメントの下書き。key は同じネタかどうかを見分ける鍵で、
+ * {file} などを埋める前・語尾のゆらぎを足す前の文（繰り返しを避けるときに使う）
+ */
+export type Draft = { text: string; color?: string | null; pos?: DanmakuPos; isBig?: boolean; key?: string }
 
 /** 0以上1未満を返す乱数。テストでは固定値を渡す */
 export type Rand = () => number
@@ -47,7 +50,7 @@ export type Line = string | Draft
 
 function draft(line: Line, vars: Record<string, string> = {}): Draft {
   const d = typeof line === 'string' ? { text: line } : line
-  return { ...d, text: d.text.replace(/\{(\w+)\}/g, (_, key: string) => vars[key] ?? '') }
+  return { ...d, key: d.key ?? d.text, text: d.text.replace(/\{(\w+)\}/g, (_, key: string) => vars[key] ?? '') }
 }
 
 /** 色のないコメントに、ときどき色を付ける */
@@ -73,6 +76,12 @@ function rawBasename(path: unknown): string {
 function basename(path: unknown): string {
   const name = rawBasename(path)
   return name === '' ? 'ファイル' : oneLine(name, 18)
+}
+
+/** ツール呼び出しがさわっているファイルの名前（なければ undefined） */
+export function fileName(input: Readonly<Record<string, unknown>>): string | undefined {
+  const name = rawBasename(input.file_path ?? input.notebook_path)
+  return name === '' ? undefined : oneLine(name, 18)
 }
 
 // ---- プロンプト ----
@@ -311,7 +320,7 @@ export function reactToPrompt(text: string, rand: Rand, hour?: number): Draft[] 
   if (length > 200) out.push(draft(pick(LONG_PROMPT_LINES, rand)))
   else if (length > 0 && length <= 6) out.push(draft(pick(SHORT_PROMPT_LINES, rand)))
   if (hour !== undefined && rand() < 0.3) out.push(draft(pick(TIME_LINES[timeOfDay(hour)], rand)))
-  out.push(...pickSome(PROMPT_LINES, 3, rand).map(l => draft(l)))
+  out.push(...pickSome(PROMPT_LINES, 3, rand).map(l => vary(draft(l), rand)))
   const head = oneLine(text, 16)
   if (head !== '') out.unshift({ text: `【お題】${head}`, color: orange, pos: 'ue' })
   return out
@@ -399,6 +408,17 @@ export const TOOL_LINES: Readonly<Record<string, readonly Line[]>> = {
     '{tool} !?', 'なにそれ', '新技きた',
     { text: '謎ツール', color: purple },
     '{tool} 便利そう', 'レア技', '隠し機能？', '引き出し多い', 'kwsk', '見たことない',
+  ],
+  Workflow: [
+    '軍団召喚', 'エージェント祭り', '総力戦', '分身の術・極', '全軍出撃',
+    { text: 'オールスター', color: yellow },
+    'レイドバトル', 'ギルド結成', 'ﾜﾗﾜﾗ出てきた', 'もはや会社', '司令塔きた',
+    { text: '総攻撃開始', color: red },
+  ],
+  Monitor: [
+    '監視班配置', '張り込み開始', '見張り番', 'ログ監視ニキ', '双眼鏡スタンバイ',
+    { text: '警戒態勢', color: orange },
+    '目を光らせてる', '刑事ドラマかな', 'あんパン買ってくる', '定点観測',
   ],
 }
 
@@ -642,6 +662,10 @@ export function toolGroup(tool: string): string {
       return 'Plan'
     case 'Skill':
       return 'Skill'
+    case 'Workflow':
+      return 'Workflow'
+    case 'Monitor':
+      return 'Monitor'
     default:
       return 'Other'
   }
@@ -1160,6 +1184,18 @@ function bashSpecial(input: Readonly<Record<string, unknown>>) {
   return BASH_SPECIAL.find(s => s.re.test(command))
 }
 
+/** テストの出力に失敗の跡があるか（`npm test | tail` のように終了コードが隠れていても気づく） */
+const TEST_FAILED_RE = /\b[1-9]\d*\s+(?:failed|failing|failures?)\b|^\s*FAIL\b|\bFAILED\b/m
+
+export function testFailed(output: string): boolean {
+  return TEST_FAILED_RE.test(output)
+}
+
+/** テストを走らせる Bash か */
+export function isTestCommand(tool: string, input: Readonly<Record<string, unknown>>): boolean {
+  return toolGroup(tool) === 'Bash' && typeof input.command === 'string' && TEST_RE.test(input.command.slice(0, BASH_SCAN_CHARS))
+}
+
 function fileKind(input: Readonly<Record<string, unknown>>) {
   const name = rawBasename(input.file_path ?? input.notebook_path ?? input.path)
   return name === '' ? undefined : FILE_KINDS.find(k => k.re.test(name))
@@ -1173,8 +1209,15 @@ export function reactToToolStart(tool: string, input: Readonly<Record<string, un
   const group = toolGroup(tool)
   const special = group === 'Bash' ? bashSpecial(input) : undefined
   const kind = FILE_GROUPS.has(group) ? fileKind(input) : undefined
-  const lines = special?.start ?? (kind !== undefined && rand() < 0.4 ? kind.lines : undefined) ?? TOOL_LINES[group] ?? TOOL_LINES.Other!
-  return [tint(draft(pick(lines, rand), vars), rand)]
+  const lines =
+    special?.start ??
+    (kind !== undefined && rand() < 0.4 ? kind.lines : undefined) ??
+    // さわっているファイルや、走らせたコマンドそのものにも触れる
+    (FILE_GROUPS.has(group) && fileName(input) !== undefined && rand() < 0.3 ? FILE_TEMPLATES : undefined) ??
+    (group === 'Bash' && vars.cmd !== '' && rand() < 0.25 ? CMD_TEMPLATES : undefined) ??
+    TOOL_LINES[group] ??
+    TOOL_LINES.Other!
+  return [vary(tint(draft(pick(lines, rand), vars), rand), rand)]
 }
 
 export type ToolOutcome = { isError: boolean; isDenied: boolean }
@@ -1195,7 +1238,7 @@ export function reactToToolEnd(tool: string, input: Readonly<Record<string, unkn
 export function reactToToolOk(tool: string, input: Readonly<Record<string, unknown>>, rand: Rand): Draft[] {
   const lines = TOOL_OK_LINES[toolGroup(tool)]
   if (lines === undefined || lines.length === 0) return []
-  return [tint(draft(pick(lines, rand), varsOf(tool, input)), rand)]
+  return [vary(tint(draft(pick(lines, rand), varsOf(tool, input)), rand), rand)]
 }
 
 // ---- 連発・連続エラー・節目 ----
@@ -1392,7 +1435,7 @@ export function reactToTurnEnd(turn: TurnSummary, rand: Rand): Draft[] {
       if (turn.tools >= 15) out.push(draft(pick(MANY_TOOLS_LINES, rand)))
       else if (turn.tools === 0) out.push(draft(pick(NO_TOOLS_LINES, rand)))
       if ((turn.errors ?? 0) >= 3) out.push(draft(pick(TOUGH_TURN_LINES, rand)))
-      out.push(...pickSome(OTSU_LINES, 4, rand).map(l => draft(l)))
+      out.push(...pickSome(OTSU_LINES, 4, rand).map(l => vary(draft(l), rand)))
       if (rand() < 0.35) out.unshift(pick(OTSU_BANNERS, rand))
       return out
     }
@@ -1421,7 +1464,25 @@ export const AMBIENT_LINES: readonly Line[] = [
 export const THINKING_LINES: readonly Line[] = [
   '長考', '脳内会議中', 'ひらめき待ち', '頭フル回転', '考えてる考えてる', '熟考タイム', 'うーん…',
   '何か企んでる', 'ゾーン入った', 'ぐるぐる', '計算中', '知恵熱でそう', '寝てる？', '溜めてる',
-  '嵐の前の静けさ', 'Now Loading...',
+  '嵐の前の静けさ', 'Now Loading...', '長考に入りました', '次の一手は…', '静寂…', '将棋の解説欲しい',
+  '封じ手かな', 'ﾁｯﾁｯﾁｯ', '頭の中ではもう100行', '読み筋いくつあるんだ', '沈黙が長い', '黙考', 'この間がすき',
+  '思考の海に潜った', '何を思いついたんだ', '答えはもう出てそう', '腕組みしてそう', '天井とにらめっこ',
+  '脳内ペン回し', 'ホワイトボード貸そうか', 'ここが一番大事なとこ', '熟成中', '言葉を選ぶ時間', 'ｶﾁｺﾁｶﾁｺﾁ',
+  '推理パート', '方針決まった？', '(-_-)ｳｰﾝ', '(´・_・`)ﾝｰ', '試験前の顔', '選択肢を消去法で',
+  '頭の中で付箋貼ってる', '構想5年みたいな顔', '瞑想タイム', '悟り開きそう', 'アイデア降りてこい',
+  '電球まだ光らない', '唸れ脳みそ', 'ムムッ', 'ファン回る音する', '問題文読み直してる？', '地図を広げてる段階',
+  'ここで間違えると痛い', '溜め技くる', 'チャージ中', '長い詠唱', '思考ログ公開して', '考察班集合',
+  '初手Bashと見た', '最初はRead派に1票', '初手で性格出る', '様子見', 'お、止まった', 'ﾎﾟｸﾎﾟｸﾎﾟｸ',
+  '間の取り方が玄人', '俺なら即ググる', '何パターン考えてるの', 'プランA、B、C…', '精神統一',
+  '誰か急かしてる？', '沈黙は金', '……', 'ん？', '脳内タブ何個あるの', '長考に好手なしって言うけど',
+  '次のセリフ待ち', '静かな立ち上がり', 'いきなり動かないの偉い',
+  { text: '考え中', color: cyan },
+  { text: 'ｷｭｲｰﾝ', color: blue },
+  { text: '何か来るぞ', color: orange },
+  { text: '今は種まき', color: green },
+  '考えてるだけで絵になる', '黙ってても強者感', 'これは長くなるぞ', 'まだ動かんｗ', '息止めて見てる',
+  'AIも迷うんだな', 'ここで質問返しされたら笑う', '考え事してる猫みたい', '書く前に考えるの大事',
+  'さあどう出るか', '設計図まだ白紙',
 ]
 
 /** さっきエラーが出たとき */
@@ -1430,13 +1491,44 @@ export const AFTER_ERROR_LINES: readonly Line[] = [
   '想定内', '計画通り', 'こっからこっから', '落ち着いて', '気にすんな', 'そういう日もある', 'エラーは友達',
   'まだいける',
   { text: '負けるな', color: pink },
+  'ログの3行目が怪しい', 'はい深呼吸', '電源抜いて挿し直せ', 'わかる、それ俺もなった', '画面が真っ赤',
+  'トレースが巻物級', '英語だけど読めば分かる', 'typoじゃね？', '閉じカッコ数えて', '大文字小文字かも',
+  'キャッシュのせいでは', 'node_modules焼こう', '俺の環境では動く', '昨日は動いてたのに', 'お祓い案件',
+  '塩まいとく', '今日は仏滅', '大丈夫、誰も見てない', 'いや全員見てたよ', 'スクショした', '切り抜き確定',
+  'エラー出てからが勝負', '良いエラーだ', '仮説ひとつ消えた', 'むしろ前進', '泣くな', '(つд⊂)', 'ｵﾛｵﾛ', 'ｱﾜﾜﾜ',
+  'ﾋﾞｸｯ', '心臓に悪い', '一瞬ヒヤッとした', 'エラー文そのまま検索', '同じ症状の人いそう',
+  '去年の自分を見てるよう', '新人時代思い出す', '胃がキリキリ', '人のエラー見ると安心する', '仲間だな',
+  '一発で通ったら逆に怖い', 'ブレークポイントの出番', '変数を疑え', '二分探索の時間だ', '一個前に戻すのもあり',
+  '焦りは禁物', 'エラー文が呪文', '草も生えない', '再現するならまだ勝てる', '赤字は伸びしろ', '修行パート',
+  '序盤の負けイベ', '残機1減った', 'セーブしてた？', '撤退も勇気', '一回寝よ', '朝やったら一瞬で直る',
+  '散歩すると直る説', 'アヒルに話しかけて', '誰でもやるやつ', '何が起きた？', '言わんこっちゃない',
+  'フラグ回収お見事', '(・_・;)', 'Σ(・□・;)', 'ノーエラー回は幻', 'メッセージ親切じゃん', 'ノーカンノーカン',
+  { text: 'いける、次は通る', color: orange },
+  { text: 'ここで折れるな', color: pink },
+  { text: '赤字注意報', color: red },
+  'エラー吐くのも仕事のうち', 'バグの方から来てくれた', '派手にいったなｗ',
 ]
 
 /** 作業が2分を超えたとき */
 export const LONG_WORK_LINES: readonly Line[] = [
   '長丁場', '耐久配信', '作業用動画', 'まだ続く', '何分経った？', '水分補給しろ', 'トイレ行ってくる',
   'ここまで見た人挙手', '超大作の予感', 'お菓子補充', 'エンドレス', 'ストレッチしよ', '根気すごい',
-  '休憩も大事',
+  '休憩も大事', '長編になってきた', '途中から見た人いる？', '肩こってきた', '終わりが見えない', '第3章突入',
+  '映画なら中盤', '最初のお題なんだっけ', '冒頭の記憶が遠い', '前回までのあらすじ', '今来た人に説明して',
+  'カフェイン切れそう', '冷めたお茶すする', 'ご飯炊ける音で我に返る', '正座やめよ', '目薬さしとこ',
+  '腰がやばい', 'スマホが熱々', '通勤中に見始めたのに', '昼休み終わる', '寝る前にちょっとのつもりが',
+  '気づいたら見入ってた', '時間が溶けていく', '何合目？', '地下何階まで行くの', '一回コミットしとけ',
+  'その集中力わけて', 'AIは疲れ知らずか', '骨太な回', '大工事', '年末の大掃除', '夏休みの宿題',
+  '卒論書けそうな長さ', 'そろそろ山場か', '長いけど飽きない', '起きたらまだやってた', '二周目勢です',
+  '最初から見てる勢', '皆勤賞いただきます', '最後まで付き合う', '完走したら赤飯', 'ピザ頼んだ',
+  '作業BGM一周した', 'ラジオ感覚で聞いてる', 'シークバーが仕事してない', '時計二度見', 'お題そんな重かったっけ',
+  '思ったより大物', 'あと何話あるの', '湯船で視聴中', '( -_-)ﾉ旦~', 'もう少しで終わる気がする',
+  '手が止まらないのすごい',
+  { text: '長期戦の構え', color: orange },
+  { text: '体力ゲージまだ満タン', color: green },
+  { text: 'まだ序章説', color: purple },
+  'この配信いつ終わる？', '一句詠めそう', '長えｗ', 'おやつ二回目', '充電あと8%', '長いのは丁寧な証拠',
+  '画面焼けしそう',
 ]
 
 /** ツールを立て続けに使っているとき */
@@ -1444,6 +1536,20 @@ export const BUSY_LINES: readonly Line[] = [
   '作業はえーよ', 'TAS', '倍速', '目が追いつかない', '残像だ', 'ﾊﾞﾊﾞﾊﾞﾊﾞ', 'RTA勢', '早送り？',
   'フルスロットル', 'キーボード壊れる', '怒涛の展開',
   { text: '無双', color: red },
+  '指が見えない', '作業量えぐい', 'コメントが追いつかん', '手元どうなってんの', '千手観音かな',
+  'ログが滝のよう', '一時停止して', '0.5倍速で見たい', 'もう何してるかわからん', '置いてかないで',
+  '待って待って', '速い速い速い', 'ﾀﾞﾀﾞﾀﾞﾀﾞ', '連射機能付きか', 'ブレーキどこ', '暖機運転終了',
+  '本気出してきた', '今日イチのキレ', 'ベルトコンベア', 'わんこそば状態', 'リズムゲー始まった',
+  'フルコンボいけ', 'BPM高すぎ', '摩擦で発火しそう', '手首大丈夫？', '速すぎて逆に落ち着く',
+  '見てるだけで疲れる', '情報の洪水', 'ついていけてる人いる？', '3行前がもう昔', '瞬きしたら終わってた',
+  '一瞬で3個やった', '手さばきが異次元', 'ガトリング', '雨あられ', 'まだ上がるのか', '4速入った', '(ﾟдﾟ)ﾎﾟｶｰﾝ',
+  '(@_@)', 'はっや', 'ちょ、速', 'どこで息継ぎしてるの', '作業密度バグってる', 'APMいくつだよ', '一人で三人分',
+  '休憩という概念がない', '弾幕より速いの反則', 'ログ読む前に次いってる', '新幹線通過中',
+  { text: '疾風迅雷', color: cyan },
+  { text: 'フィーバータイム', color: red, isBig: true },
+  { text: 'ﾋﾞｭﾝﾋﾞｭﾝ', color: blue },
+  'これ録画して後で見る', '動体視力ためされてる', 'いま何個やった？', '目が乾く', 'スクロールバーが縮む',
+  '工場見学ツアー', '俺の一日分が一瞬', 'ポップコーン食べ忘れ',
 ]
 
 /** たまに流れる、同じ文字を並べた弾幕 */
@@ -1460,19 +1566,601 @@ export const WALL_LINES: readonly Line[] = [
   { text: 'wktkwktkwktk', color: blue },
 ]
 
+// 作業中のつぶやきのジャンル。いろいろな人が見ている感じを出すため、ジャンルを先に選んでから中身を選ぶ
+
+/** 視聴者の雑談（ごはん・天気・仕事など、作業と関係ない話） */
+export const SMALLTALK_LINES: readonly Line[] = [
+  '晩ごはん麻婆豆腐', 'ポテサラにりんご賛成', '新作プリン当たりだったわ', 'のり塩しか勝たん',
+  '湯切り失敗して麺が床に', 'エナドリ二本目いきます', '白湯がしみる…', '実家から柿どっさり', 'ピザ頼んじゃった',
+  '納豆まぜまぜ中', 'おにぎりの具なに派？', '夜食のラーメンは罪の味', '冷凍うどん万能説',
+  'たこ焼きひっくり返すの楽しい', '卵かけご飯で十分', 'ミルクティーに砂糖3杯', '寿司食いてえ',
+  '弁当の唐揚げは最後派', '梅干しすっぱっ', 'お茶こぼしたｱｯ', 'カレーは二日目が本番', 'グミ硬すぎて顎が死ぬ',
+  'もぐもぐ', '昨日3時間しか寝てない', '二度寝は正義', '昼寝したら夕方', '目覚まし五個かけてる',
+  '布団から出られん', 'ねむ', 'まぶたが重力に負けそう', 'あくび止まらん', '寝坊して朝ごはん抜き',
+  '(つд⊂)ｺﾞｼｺﾞｼ', '雨の音すき', '外、台風みたいな風', '傘忘れた人です', '洗濯物ぬれた…', '湿気で髪が爆発',
+  { text: '雷鳴ってビクッ', color: yellow },
+  '部屋寒くない？', 'エアコンの温度で家族と冷戦中', '晴れたから布団干した', '窓開けたら虫が侵入',
+  '電車で見てる勢', '満員電車でぺちゃんこ', '一駅乗り過ごした', 'バス全然来ないんだけど',
+  '自転車パンクしたんだが', '明日のプレゼン資料白紙', 'レポートあと二千字', '課題しながらﾁﾗ見',
+  '上司からチャットきたｺﾜｲ', '定時ダッシュ成功', '残業確定のお知らせ', 'テスト前なのに何してんだ',
+  '来週から研修か', '有給とった', '在宅最高', '会議延びすぎでは', 'バイト終わり', 'シフト表見て絶望',
+  '部活でへとへと', '塾の自習室から', '経費精算は明日の自分へ', '月曜こないで', '昼休みあと5分',
+  { text: '給料日', color: yellow },
+  '金欠', '猫が膝の上で寝ちゃって動けない', 'インコが着信音マネする', '猫にキーボード踏まれてjjjjj',
+  'ハムスター脱走事件', '金魚がエサくれダンス', '犬の寝言かわよ', '亀の日光浴タイム',
+  '犬が自分のしっぽ追ってるｗ',
+  { text: 'メダカに赤ちゃん誕生', color: green },
+  'セールでまた積んだ',
+  { text: 'ガチャ爆死', color: purple },
+  'デイリー消化がもはや義務', 'スタミナあふれさせがち', 'ランクマ五連敗', '押し入れから古いゲーム機',
+  'パズルゲーにハマり中', '机の上が地層', 'モニター増設計画', '椅子ギシギシ問題', '加湿器が給水しろって',
+  'サボテンすら枯らせる才能', '掃除しなきゃなー', 'ゴミ出し忘れてた…', '宅配きたので離席', '隣で工事ガガガガ',
+  'スマホの充電あと3%', 'Wi-Fiがカクカク', '冷蔵庫開けて何しに来たか忘れた', '財布がレシートでパンパン',
+  '個人開発止まってる', 'ブログ三日坊主', '自作キーボード組んでる', 'ポートフォリオ作り中',
+  '資格の勉強サボり中', '英単語帳ひらいたまま', '腕立て10回で限界', '編み物しながら', 'プラモの塗装乾き待ち',
+  '家計簿つけなきゃ', '自分のPRも溜まってる', '子ども寝かしつけ完了', '親に何見てるか聞かれた',
+  '米10キロ担いで帰宅', '美容院いつ行こう', '歯医者の予約あしたか…', 'しゃっくりが長期戦',
+  'くしゃみ出そうで出ない', '小指をタンスの角に', 'ただいま', '風呂上がり', '散歩してこよ',
+  'みんなの推し調味料は？', '今どこから見てる？', '誰か起きてる人ー', '明日って祝日だっけ？',
+  'レジで小銭ぶちまけ', '腹へったー', '今日ちょっといい日', '筋肉痛', '二日酔い', '鼻水ずるずる(´Д｀)',
+  '目が乾く',
+]
+
+/** いろいろな言い方の応援 */
+export const CHEER_LINES: readonly Line[] = [
+  '信じて待つのみ', '君ならやれる', '最後まで見届けるぞ', '焦らず一歩ずつ', '肩の力抜いてこ',
+  '一回深呼吸しよっか', '丁寧なのが一番', '今日はいける気がする', '背中そっと押しとく', '画面に向かって合掌',
+  '朝まで付き合うよ', '地道が最強', '応援うちわ作ってきた', 'ペンライト両手持ち', '届けこのエール',
+  '勝ち筋、見えた', '迷ったら戻ればいい', 'やり直しは何度でも', '差し入れのおにぎり置いとく', '頼りにしてます',
+  'きっとうまくいく', '今日も味方です', '気合い注入', '元気おすそわけ', '勝利の舞を奉納', 'ご武運を',
+  '勝手に応援団長', '横断幕できあがり', 'ちゃんと進んでるよ', '見てる人いるからね', '一生推す', '主役は君だ',
+  '伸びしろしかない', 'ここが踏ん張りどころ', 'いつも通りでOK', '無理しないでね', '勝ったらケーキな',
+  '祝杯の準備しとこ', 'ゴールは近いぞ', 'あとひと押し',
+  { text: 'えいえいおー', color: red },
+  { text: '押せ押せ！', color: orange },
+  '余裕っしょ', '自信持っていいよ、ほんとに', '元気もらってるのはこっち', 'がんばる姿すき',
+  '応援コメ連投するね', '一緒に走ってる気分', 'いよいよ見せ場', '心の中で旗ぶんぶん', '君のペースでいい',
+  'そのまま突き抜けろ',
+  { text: '希望の光', color: yellow },
+  '結果は後からついてくる', '外野からテレパシー', 'よし、いこう', '胸を張れ', 'ｶﾞﾝﾊﾞｯ!',
+  { text: '託した', color: orange, isBig: true },
+  'ﾌﾚｰ(*´∀｀)ﾉ',
+  { text: 'このコメントが届きますように', color: pink },
+  'こまめなセーブ大事', '地元の星', '画面の向こうで拍手', '頼んだぞ', 'うまくいかなくても好きだよ',
+  'ここまで来たのが既に偉業', '褒め言葉ストック済み', '詰まったらお茶休憩', 'GO!GO!',
+]
+
+/** 配信そのものへの実況・ツッコミ */
+export const PLAY_BY_PLAY_LINES: readonly Line[] = [
+  'さて本題か', 'おっと方向転換', '情報量えぐ', '何が起きてるの', '素人目にもすごい', 'お手並み拝見', 'Σ(ﾟдﾟ)',
+  '有識者いる?', '解説席あいてます', '迷わず行くね', '判断はやっ', '今の間なに?', '黙々とやってる',
+  '淡々としてて好き', '無言の圧', 'いろいろ開いてる', '順調っぽいな', '雲行きが…', 'ナイス判断',
+  '何合目くらい?', 'これ伏線？', 'フットワークが軽快', 'そっち行くんだ', '意外なルート', '回り道も味',
+  '見てるこっちが緊張', 'あ、空気が変わった', '一気に進んだ', '牛歩だけど確実', '地味パート',
+  'パズル組んでる感じ', '準備運動かな', 'ここから加速しそう', 'テンポいいの気持ちいい', 'リズム出てきた',
+  '無駄ゼロ', '手数多いな', '腰を据えてるね', '慎重だね', '石橋叩いて渡るタイプ', '堅実', '大胆だな',
+  '攻めるねぇ', '守りの姿勢', 'ひと呼吸タイム', 'なんか良さそう', 'なにこれすご', 'ふむ', 'へぇ', 'ほう…',
+  'おっ', 'おや', 'ほんまか', 'うそやん', 'さっきの何だったの',
+  { text: '脳の処理落ち', color: blue },
+  'まるで料理番組', '何もわからんけど楽しい', '雰囲気で見てる', 'カタカナ語の嵐', 'いま誰のターンなの', 'ﾀﾀﾀﾀｯ',
+  'ドキュメンタリーみ', '現場からは以上です', 'カメラさん寄って', '生放送の緊張感', '要チェックや',
+  '目が離せない', '( ´_ゝ`)ﾌｰﾝ', 'ログが流れていく',
+  { text: '文字の滝', color: cyan },
+  'スクロールバーちっさ', '今の高等テクでは', '完全に置いてけぼり', '想像の斜め上', '王道の攻め',
+  '本気モード突入', '見てるだけなのに疲れたｗ', '急に真顔で草', '視線が右往左往', 'どこに向かってるのか楽しみ',
+  'ここ録画しとけばよかった', 'これは長くなるぞ', '一旦様子見か', 'そろそろ山場', '設計図が見えてる人の動き',
+  '体感まだ序盤', '(・_・;)', 'ここBGM変わるとこ', 'ハラハラ',
+]
+
+/** プログラマのあるある・小ネタ */
+export const DEV_TALK_LINES: readonly Line[] = [
+  'vimの閉じ方まだググる', ':wqをSlackに誤爆', 'Emacsはもはや住処', '拡張入れすぎてVS Codeが亀',
+  'エディタ戦争、もう飽きた',
+  { text: 'nanoで何が悪いんだ', color: cyan },
+  '結局メモ帳最強説', 'タブ派、ここにいます', 'スペース2つ以外は異端', 'data2_final_v3', 'tmpが本番で生きてる',
+  'utilsが育ちすぎる問題', '変数a,b,cは事件', 'flgって書くのやめよ',
+  { text: 'isNotDisabledは罪', color: purple },
+  'コミットメッセージ「修正」', 'git blameしたら犯人自分', '.DS_Storeまた混入', 'squash派とmerge派の溝',
+  'wipコミット47連', 'mainに直pushは禁忌', 'CIでだけ落ちるの何なん', 'YAMLのインデントで事故',
+  'リトライで通るテストは信用ゼロ', 'CI40分待ちは拷問',
+  { text: '金曜17時以降のリリース禁止', color: red },
+  '続きは月曜の自分が', '金曜だぞ', '誰も触れない聖域ファイル', '3000行の関数、実在します',
+  '「なぜか動く」ってコメント', '書いた人もう退職済み', 'jQueryまだ現役です', 'goto文…', 'コメントと実装が真逆',
+  'TODO: 2015年', 'READMEだけ3年前', 'ドキュメントは生もの', '社内Wikiは墓場', 'その会議、メールでよくない？',
+  '見積もりは3倍しとけ', '「ちょっと直すだけ」が一番重い', '残り1割に9割', 'ﾃﾞｽﾏｰﾁ', 'エナドリは寿命の前借り',
+  'コーヒー切れでIQ半減', '椅子にだけは金かけろ', '腰をいたわれ', '自作キーボード沼へようこそ',
+  '赤軸か茶軸か論争', 'ショートカット覚えると世界変わる', 'マウス触ったら負け', 'ダークモード以外ありえん',
+  'ライトモード派、肩身せまい', '回答が11年前のやつ', '「解決しました」だけの人', 'ググれば勝ち',
+  '人間よりAIのレビューが丁寧', '補完に先を読まれる日々', 'AIについ敬語つかう', 'モノレポ移行、3ヶ月コース',
+  'node_modulesは異次元', '依存のアプデは月曜に', 'semverを信じすぎるな', 'セミコロン戦争まだやる？',
+  'ASIに命あずける勇気', 'null安全は人類の希望', 'null≠undefined', 'NaNは自分と等しくない',
+  { text: 'タイムゾーンは魔物', color: orange },
+  '夏時間、誰得なの', 'とりあえずUTCで保存', 'うるう年テスト書いた？', '2038年問題、あと12年', '正規表現は呪文',
+  '後読みとか誰が読むの', '配列は0から数えろ', '<= と < で丸1日', 'フェンスポスト問題',
+  'とりあえずキャッシュ消せ', '再起動した？', 'ログを読め、話はそれからだ',
+  { text: 'ラバーダックに話しかけろ', color: yellow },
+  'ステップ実行で日が暮れる', 'console.log消し忘れ', '0.1+0.2≠0.3', '文字化けはだいたいSJIS', 'UTF-8一択',
+  '全角スペースは見えない敵', '僕の環境では動きます', 'Dockerなら動く、は幻想', '深夜のコードは翌朝読め',
+  'nitsだけで30件', '動く。なぜ', 'アラートは寝た瞬間に鳴る', 'オンコール週は風呂もスマホ持参',
+  'ステージングでは平和だった', 'ポストモーテムは文学', '車輪の再発明は楽しいぞ', '小さく作って小さく出せ',
+  'YAGNIって言いたいだけ', 'DRYしすぎも地獄', '継承より合成', 'マジックナンバー42',
+  { text: '空のcatchは犯罪', color: red },
+  'evalは悪', 'カバレッジ100%は宗教', 'テストのないコードは祈り', '3日前の自分が一番の敵', '仕様変更は突然に',
+  '「軽微な修正」とは', '言語なんてただの方言', 'Lispの括弧で溺れる夢', 'z-index: 99999',
+  { text: 'Excel方眼紙は文化遺産', color: green },
+  '仕様です(震え声)', 'LGTM(見てない)', 'N+1', '// FIXME', 'segfault', '∞ループ', 'wontfix', 'sudo !!',
+  '身に覚えが…', '_(:3」∠)_', 'ｺﾞﾌｯ', '耳が痛い',
+  { text: '胃が…', color: purple },
+  'ｸﾞｻｯ',
+  { text: 'ﾌﾞｰﾒﾗﾝ', color: orange, isBig: true },
+]
+
+/** 配信者やほかの視聴者への質問 */
+export const QUESTION_LINES: readonly Line[] = [
+  'これ何言語？', 'フォント何使ってるの', '配色テーマ教えて', 'キーボード何使ってる？', 'これ仕事の案件？',
+  '趣味で作ってるやつ?', 'で、何作ってるんだっけ', '途中参加です、今どこ', 'これOSS？', 'リポジトリ非公開？',
+  { text: 'Claudeくん何年目？', color: pink },
+  'AIに全部任せて平気？', '中の人いる?', '寝なくて大丈夫なの', '1日何時間やってるん', 'テスト書くコツ教えて',
+  'モックってどこまで使う？',
+  { text: 'タブ派？スペース派？', color: cyan },
+  'vimキーバインド勢？', 'Mac？Windows？', 'WSLでも動く?', 'Nodeのバージョンいくつ', 'npmかpnpmかbunか',
+  '型って書いたほうがいい？', '初心者お断り配信？', '独学でもいけるかな', '入門書のおすすめ求む',
+  '何から勉強すればいい', 'アーカイブは？', '今日何時までやる予定', '次回いつ？', 'ここ質問OK？',
+  'さっきのコマンド何', '今なにが起きた？', 'それで直るの何故', 'え、それ本番用??', '会社で使ってもOK?',
+  'ライセンス何？', '自分のPCでも可能？', 'メモリ何GB？', 'Copilotと比べてどう？', 'AIって嘘つかない？',
+  '間違えたら誰が直すの', '見てるだけで上達するもん？', 'どうしたらそんな速さに', 'コメントは英語で書く？',
+  '変数名ローマ字はアリ？', '正規表現どこで覚えた', 'rebase派？merge派？', 'コミットはどの粒度で？',
+  '1PRって何行まで？', 'レビュー担当って誰', 'CIは何？Actions？', 'これ何分で終わりそう？',
+  { text: 'エラーってどこから読む？', color: yellow },
+  'デバッガ使わない主義？', '環境変数ってどこに書く？', '結局Reactが正解？', 'フロントとバックどっち寄り',
+  '文系でもなれますか', '何歳から始めた？', '誰か解説プリーズ', 'これってすごいこと？', '今の笑うとこ？',
+  '待って、どういうこと', 'えっ、なぜ', 'ん？', '？？？', '推し言語は？',
+  { text: '一番つらかったバグは？', color: orange },
+  '最近気になってる技術とか', 'この弾幕どうやって出してる', '英語読めないと無理？',
+]
+
+/** 視聴者の自分語り */
+export const VIEWER_STORY_LINES: readonly Line[] = [
+  '昨日これで終電アウト', 'うちまだFTPでデプロイ',
+  { text: '新人のとき本番DB消した', color: red },
+  '先輩のvimrc丸パクリ', '初PRでコメント80件', '卒論のコードは封印済み', 'ガラケーアプリ作ってた世代',
+  '面接のFizzBuzzで詰んだ', '今日リリース日でガクブル', '上司も見てるらしい', '有給とって正座待機',
+  '寝かしつけ終わって参戦', '通勤電車から', 'Scratch出身です', '文系卒、転職3年目', '40で未経験から入ったよ',
+  '定年後の趣味がこれ', '現役高校生！', '課題やらずに見てるｗ', '明日締め切りなのに…', '社食でこっそり',
+  { text: '猫がEnter押して本番反映', color: pink },
+  '昔は全部Perlだったなぁ', '前の会社、レビュー文化ゼロ', '社内システムがPHP5', 'タイムゾーンで請求ずれた事件',
+  'ハッカソンで優勝経験あり', '去年の年末年始はオンコール', '社内LT、来週デビュー', '引き継ぎ資料が付箋1枚',
+  'コメントに前任者の愚痴', 'テスト書いたら神扱い', 'ビルド待ち＝筋トレタイム', 'セミコロン1個に2時間',
+  'CSVをExcelで開いて事故', 'typo1文字で始末書', '前の現場、zipでバージョン管理', 'マクロおじさんと呼ばれてる',
+  '初めて動いた時ちょっと泣いた', 'キーボード3台目突入', '腱鞘炎でトラックボール民に',
+  '在宅で3日誰とも話してない',
+  { text: '酔ってpushした過去がある', color: purple },
+  '金曜デプロイ→土曜出勤', '中学の頃はHTML手打ち勢', 'うちAI使用禁止なんだよね', '今日はじめてgit触った！',
+  'Dockerとはまだ冷戦中', 'rebaseもう怖くないぞ', '趣味はRustの同人誌', '研修でこの配信が教材',
+  '夜勤明けの朝ごはん中', '病院の待合室から',
+  { text: '海外から見てるよ', color: cyan },
+  '時差でこっちは朝5時', '育休中に勉強再開', '娘にPython教えてる', '父はCOBOL一筋40年', '祖母はVLOOKUPの達人',
+  '前職はパン屋', '新しい現場3日目', '来月から転職先でReact', '15年やっても命名で悩む',
+  '同じエラーで昨日3時間沼', 'うちのリポジトリ8GB', 'インターン先がまさにこれ', 'バイト先のシフト表を自作',
+  '徹夜デプロイの夜(遠い目)', 'さっきまで障害対応、今は癒し', 'それ私', 'うちもｗ', '実話です', '前科あり',
+]
+
+/** 直前のコメントへの返事 */
+export const REPLY_LINES: readonly Line[] = [
+  '↑それ', '↑たぶん同い年', '↑わかりみ', '↑IQたっか', '↑急にどうした', '↑ほんこれ', '↑せやな', '↑それはそう',
+  '>>いやいや', '↑何言ってんだｗ', '↑既出', '↑ナイスツッコミ', '↑言うと思ったわ', '↑誰がうまいこと言えと',
+  '↑落ち着け', '↑知ってる定期', '>>それ俺も', '↑解釈一致',
+  { text: '↑その発想はなかった', color: yellow },
+  '↑詳しすぎワロタ', '↑有識者いて助かる', '↑いや、それは違くない？', '↑お、おう', '↑ﾅﾆｿﾚ',
+  '↑ちょっと分かる自分が嫌', '↑今それ言う？', '↑本職の人？', '↑ちょっと黙ってｗ', '↑人の心とかないんか',
+  '↑そこ拾うんかい',
+  { text: '↑名言製造機', color: orange },
+  '↑ブーメラン', '↑ログに残しとくわ', '↑えっ', '↑はいはい解散', '↑それ何年前の話？', '↑俺の代弁者',
+  '>>違う、そうじゃなくて', '↑( ﾟдﾟ)ﾎﾟｶｰﾝ', '↑一理あるかも', '↑あとで職員室な', '↑首もげるほど頷く',
+  '↑ここ笑うとこ？', '↑この人好き', '>>マジレスすると…',
+]
+
+/** いまの作業に触れるつぶやき。{topic} はお題の言葉、{file} はさわっているファイル、{cmd} は走らせたコマンド、{n} はツールを使った回数、{min} は経過分 */
+export const TOPIC_TEMPLATES: readonly Line[] = [
+  '今日は{topic}の日か', '{topic}と聞いて駆けつけた', '{topic}って地味に体力勝負', 'うちの{topic}も見てほしい',
+  '{topic}だけで1時間語れる', '昨日{topic}で泣いた', '{topic}…ｺﾞｸﾘ', '{topic}かぁ',
+  { text: '{topic}！', color: orange },
+  'え、{topic}やるの？', '{topic}とは（哲学）', '{topic}の民、集合', '実は{topic}初見です',
+  '{topic}わからんの俺だけ？', '先輩が{topic}担当でさ', '{topic}は奥が深いぞ', '{topic}で検索したらここ',
+  'あ～{topic}なつかし', '{topic}ってなんだっけ', '{topic}に一票', 'わりと{topic}きらいじゃない',
+  '{topic}の気配…！',
+  { text: '推し{topic}', color: pink },
+  '{topic}、震えて待つ', '{topic}ガチ勢おる？', 'ついに{topic}に手を出すか', '{topic}、好きな人多いよね',
+  '卒研も{topic}だったわ', '{topic}？名前だけは…', '新人の頃{topic}で詰んだ', '{topic}なんてノリでいけるよ',
+  { text: '{topic}の時間だあああ', color: yellow },
+  '{topic}とか言われても', '{topic}には苦い思い出が', '職場で{topic}押し付けられ中', '{topic}って響きが好き',
+  '{topic}チョットデキル', '{topic}でご飯3杯', '夢に{topic}出てきそう', 'もう{topic}怖くないもん',
+  '今日の主役：{topic}', '{topic}ってそういう…', 'それ{topic}の話？', '{topic}目当ての者です',
+  '{topic}、お手並み拝見', '{topic}沼へようこそ', 'ぼくも{topic}やる！', '{topic}って一生終わらん',
+  '{topic}、甘く見てたかも', '{topic}、ほほう',
+  { text: '{topic}編スタート', color: cyan },
+  'なるほど、{topic}からか', '{topic}で人生変わる説', '{topic}の質問していい？', '{topic}、昨日ググったとこ',
+  '通りすがりの{topic}おじさん', '宿題の{topic}やらなきゃ', 'なんか{topic}かわいいね',
+  '{topic}で炎上した過去あり', '{topic}ってだけでワクワク', '誰か{topic}のプロ来てくれ',
+  '{topic}の話になると早口',
+]
+export const FILE_TEMPLATES: readonly Line[] = [
+  'ほのかに{file}の香り…', '{file}、君に決めた', '{file}って誰が書いたの', 'うわ、{file}だ…',
+  '{file}くん今日も元気',
+  { text: '{file}ちゃん出番です', color: pink },
+  '{file}聖地巡礼', 'そこ{file}なんだ', '来世は{file}に住みたい', '{file}は嘘をつかない', '{file}...なるほどね',
+  '{file}の命運やいかに', '最後は{file}を信じろ', 'うちにも{file}あるわ', '{file}にコメント少なそう',
+  '{file}の過去を語ってくれ', '{file}来たら勝ち確', '今日も{file}は平和', 'みんな{file}ガン見',
+  '{file}って長いの？', '{file}か、渋い選択', '{file}がんばれー',
+  { text: '{file}、たぶん主犯', color: purple },
+  '{file}をよろしく', 'ここで{file}登場', '{file}の気持ちで見てる', '{file}知ってる、あれね',
+  'ようこそ{file}へ', '{file}にお邪魔～', '{file}、出世したな', '{file}って何担当？', '{file}は触らぬ神に…',
+  '{file}、保存した？', 'とりあえず{file}拝んどこ', '{file}いい名前じゃん', '{file}に何が起きるのか',
+  '{file}頼むぞ',
+  { text: '{file}の歴史が動く', color: orange },
+  '{file}って改行コード何？', '{file}のblame見たい', '懐かしの{file}じゃん', '{file}で事故る未来見えた',
+  '{file}…ああ、あいつか', '{file}の壁は厚いぞ', '{file}!?', 'あ、{file}', '{file}のタブ幅、何派？',
+]
+export const CMD_TEMPLATES: readonly Line[] = [
+  '{cmd}たのむ', '{cmd}で全部わかる', 'お、{cmd}出た！', '{cmd}ってどう読むの', '当方{cmd}信者です',
+  '{cmd}はもう手癖', '{cmd}を打つ指、速っ', '{cmd}終わるまで息止め中', '{cmd}ってそう使うのか',
+  'ターミナルに{cmd}の文字',
+  { text: '{cmd}、通れ！', color: orange },
+  '俺も{cmd}しとこ', 'その{cmd}いいね', '{cmd}の打鍵音が好き', 'ひとまず{cmd}で一息',
+  { text: '{cmd}に祈りを込めて', color: purple },
+  '{cmd}は基本', '{cmd}、今日覚えたやつ', '{cmd}…ふーん', '{cmd}履歴に残しとく', '{cmd}、エイリアス化しよ',
+  'ここで{cmd}か、手堅い', '{cmd}、見慣れた光景', '{cmd}の出力長そう', '迷ったら{cmd}', '{cmd}、毎回やる派',
+  'ちょ、{cmd}って', '{cmd}で何見るの', '初手{cmd}', '{cmd}、正直よく知らない', '{cmd}の返事待ち',
+  '{cmd}かーなるほど', '黙って{cmd}打つタイプ', '{cmd}に何度救われたか', '{cmd}に頼りすぎ説', '今の{cmd}見た？',
+]
+export const COUNT_TEMPLATES: readonly Line[] = [
+  '{n}手目、まだ序盤', '本日{n}アクション目です', '操作ログ{n}件', '{n}手先まで読んでる', '{n}って数字、好き',
+  'ここまで{n}手、ノーミス', '{n}操作、異常なし', '{n}手詰めかな', '{n}回動いて息切れなし',
+  { text: 'カウンター{n}', color: cyan },
+  '階段{n}段目', '{n}杯目のコーヒー', '{n}匹目のひつじ',
+  { text: '{n}ターン目の攻防', color: orange },
+  'スタンプ{n}個たまった', '{n}駅目、まだ乗る', '今ので{n}カウント', '{n}球目、振りかぶって',
+  '打数{n}、打率高め',
+  { text: '経験値{n}獲得', color: yellow },
+  '{n}コマ目の展開', '数えてたら{n}になってた', '{n}枚目のカード', '花火{n}発、たまや～', '{n}個の作業を積んだ',
+  '{n}回目で数えるのやめた', '{n}って多いの？少ないの？', '{n}、正の字で記録中', '{n}回呼ばれて嫌な顔せず',
+  'ｶﾁｬｶﾁｬ、{n}個目', 'いま{n}で合ってる？', '{n}回目、腹へった', '自己ベスト{n}更新中', '{n}回ぶんの信頼',
+]
+export const MINUTE_TEMPLATES: readonly Line[] = [
+  '{min}分の集中力', '体感だと{min}秒', '{min}分でここまで来た', '{min}分前の自分に見せたい',
+  '{min}分画面にくぎ付け', '{min}分コース', '真剣な顔して{min}分経つ', '{min}分か、水飲も',
+  '{min}分前に来た新参です', '{min}分溶けた', '入室して{min}分、まだ見る', '気づけば{min}分',
+  '{min}分？時計二度見', '{min}分ってカップ麺何個分', 'この進捗で{min}分とは', '{min}分、トイレ我慢中',
+  { text: 'この{min}分に感謝', color: yellow },
+  '{min}分見たし、そろそろ寝る', '{min}分一緒にいた仲', '作業{min}分目に突入', 'お茶が冷めた({min}分)',
+  '{min}分ぶりにまばたき', '{min}分座りっぱなし', '{min}分で一区切り？', '{min}分計測中ﾋﾟｯ',
+  '{min}分目のClaude', 'えっ、{min}分しか経ってない', '{min}分ぶんの拍手を', '{min}分の旅、まだ途中',
+  'あと{min}分は余裕', '{min}分で語彙力ゼロ',
+  { text: '配信{min}分目', color: cyan },
+  '{min}分、声出さずに応援', '{min}分ぶんの記憶がない', '{min}分、録画回してる', '{min}分記念におやつ',
+  '{min}分だと!?',
+  { text: '{min}分、ウォームアップ完了', color: orange },
+  '{min}分なのに中身が濃厚', '{min}分経っても全然飽きん', '{min}分で肩バキバキ', '推しを{min}分摂取。満足',
+]
+
+/** ジャンルと、選ばれる重み */
+const GENRES: ReadonlyArray<readonly [readonly Line[], number]> = [
+  [AMBIENT_LINES, 4],
+  [SMALLTALK_LINES, 3],
+  [PLAY_BY_PLAY_LINES, 3],
+  [DEV_TALK_LINES, 3],
+  [CHEER_LINES, 2],
+  [QUESTION_LINES, 2],
+  [VIEWER_STORY_LINES, 2],
+]
+
+function pickGenre(rand: Rand): readonly Line[] {
+  const total = GENRES.reduce((sum, [, w]) => sum + w, 0)
+  let r = rand() * total
+  for (const [lines, w] of GENRES) {
+    if (r < w) return lines
+    r -= w
+  }
+  return AMBIENT_LINES
+}
+
 /** つぶやきを選ぶための、いまの作業の様子 */
-export type AmbientContext = { elapsedMs: number; tools: number; isErrorRecent: boolean; isBusy: boolean }
+export type AmbientContext = {
+  elapsedMs: number
+  tools: number
+  isErrorRecent: boolean
+  isBusy: boolean
+  /** メインのターンは終わり、裏の作業が終わるのを待っている */
+  isBackground?: boolean
+  /** 裏で動いている作業の数（分からなければ 0） */
+  backgroundTasks?: number
+  /** お題から拾った言葉、さわっているファイル、走らせたコマンド。つぶやきのテンプレートに入る */
+  topics?: readonly string[]
+  files?: readonly string[]
+  cmds?: readonly string[]
+  /** 直前のコメントに返事してよいか */
+  canReply?: boolean
+}
+
+/** いまの作業に触れるつぶやき。入れられる材料がなければ undefined */
+function aboutNow(ctx: AmbientContext, rand: Rand): Draft | undefined {
+  const minutes = Math.floor(ctx.elapsedMs / 60_000)
+  const choices: Array<() => Draft> = []
+  const topic = ctx.topics ?? []
+  const files = ctx.files ?? []
+  const cmds = ctx.cmds ?? []
+  if (topic.length > 0) choices.push(() => draft(pick(TOPIC_TEMPLATES, rand), { topic: pick(topic, rand) }))
+  if (files.length > 0) choices.push(() => draft(pick(FILE_TEMPLATES, rand), { file: pick(files, rand) }))
+  if (cmds.length > 0) choices.push(() => draft(pick(CMD_TEMPLATES, rand), { cmd: pick(cmds, rand) }))
+  if (ctx.tools >= 3) choices.push(() => draft(pick(COUNT_TEMPLATES, rand), { n: String(ctx.tools) }))
+  if (minutes >= 1) choices.push(() => draft(pick(MINUTE_TEMPLATES, rand), { min: String(minutes) }))
+  return choices.length === 0 ? undefined : pick(choices, rand)()
+}
 
 export function ambient(rand: Rand, ctx?: AmbientContext): Draft[] {
-  let lines = AMBIENT_LINES
-  if (ctx !== undefined) {
+  if (ctx === undefined) return [vary(tint(draft(pick(AMBIENT_LINES, rand)), rand), rand)]
+  if (ctx.canReply === true && rand() < 0.06) return [draft(pick(REPLY_LINES, rand))]
+  let lines: readonly Line[] | undefined
+  if (ctx.isBackground === true) {
+    const count = ctx.backgroundTasks ?? 0
     const r = rand()
-    if (ctx.isErrorRecent && r < 0.5) lines = AFTER_ERROR_LINES
-    else if (ctx.tools === 0 && r < 0.45) lines = THINKING_LINES
-    else if (ctx.isBusy && r < 0.4) lines = BUSY_LINES
-    else if (ctx.elapsedMs > 2 * 60_000 && r < 0.3) lines = LONG_WORK_LINES
-    else if (r >= 0.95) lines = WALL_LINES
+    if (r < 0.4) lines = BG_AMBIENT_LINES
+    else if (count > 0 && r < 0.48) return [tint(bgCount(count, rand), rand)]
+  } else if (ctx.isErrorRecent && rand() < 0.4) lines = AFTER_ERROR_LINES
+  else if (ctx.tools === 0 && rand() < 0.3) lines = THINKING_LINES
+  else if (ctx.isBusy && rand() < 0.3) lines = BUSY_LINES
+  else if (ctx.elapsedMs > 2 * 60_000 && rand() < 0.2) lines = LONG_WORK_LINES
+  if (lines === undefined && rand() < 0.22) {
+    const now = aboutNow(ctx, rand)
+    if (now !== undefined) return [tint(now, rand)]
   }
+  if (lines === undefined) lines = rand() < 0.03 ? WALL_LINES : pickGenre(rand)
+  return [vary(tint(draft(pick(lines, rand)), rand), rand)]
+}
+
+// ---- 言い回しのゆらぎ ----
+
+/** ときどき語尾に付く */
+export const SUFFIXES: readonly string[] = ['ｗ', 'ｗｗ', 'ｗｗｗ', '笑', '！', '…', '（小声）', '（震え声）', '(・∀・)', '(´・ω・`)', '( ˘ω˘ )', 'ﾜﾛﾀ']
+
+/** ときどき頭に付く */
+export const PREFIXES: readonly string[] = ['いや', 'てか', 'え、', 'ガチで', 'まって', 'ほんと', 'なんか', 'やっぱ']
+
+/** 語尾がもう記号や笑いで終わっているもの・顔文字・壁にはさわらない */
+const SETTLED_RE = /[ｗw草！!？?…。」）)ー〜~]$|[(（][^)）]*[)）]|(.)\1{3,}|^[$【>↑]/
+
+/** 同じコメントでも見た目が少し変わるように、ときどき語尾や頭に言葉を足す */
+export function vary(d: Draft, rand: Rand): Draft {
+  if ((d.pos ?? 'naka') !== 'naka' || SETTLED_RE.test(d.text)) return d
+  const r = rand()
+  const chars = [...d.text]
+  if (r < 0.15) return { ...d, text: d.text + pick(SUFFIXES, rand) }
+  if (r < 0.21 && chars.length >= 3 && /[ぁ-んァ-ヶ]/.test(d.text)) return { ...d, text: pick(PREFIXES, rand) + d.text }
+  if (r < 0.24 && chars.length <= 4) return { ...d, text: d.text + d.text }
+  return d
+}
+
+// ---- いまの作業から言葉を拾う ----
+
+/** お題から拾わない、ありふれた言葉 */
+const COMMON_WORDS: ReadonlySet<string> = new Set([
+  '対応', '修正', '実装', '作成', '追加', '削除', '変更', '確認', '説明', '以下', '今回', '問題', '場合', '部分', '必要', '方法', '機能', '感じ', '自分', '全部', '一部', '最初', '最後', '現在', '今日',
+  'the', 'and', 'for', 'with', 'this', 'that', 'from', 'into', 'please', 'can', 'you', 'make', 'add', 'fix', 'use', 'file', 'files', 'code', 'some', 'more', 'all', 'not', 'are', 'was', 'have', 'should',
+])
+
+/** 漢字語のすぐ後に来ても、送り仮名ではない（助詞の）ひらがな */
+const PARTICLES = 'のをがはにでともへやかな'
+/** 漢字語のあとの「して」「する」「させ」。ただし「直して」「消して」のような一字の動詞は除く */
+const SURU = 'しすさせ'
+const SU_VERB_KANJI = '直出消戻回返残渡試探話移押指隠壊崩起落写映貸外通足減増見任寄載乗'
+
+/** プロンプトから、つぶやきに使えそうな言葉（カタカナ語・漢字語・英単語）を拾う */
+export function extractTopics(text: string): string[] {
+  // コードブロック・URL・環境変数・パス・長い英数字（鍵のようなもの）は拾わない。パスはファイル名だけ残す
+  const plain = text
+    .replace(/```[\s\S]*?(?:```|$)/g, ' ')
+    .replace(/\S+:\/\/\S+/g, ' ')
+    .replace(/\b\w+=\S+/g, ' ')
+    .replace(/\S*[\\/]\S*/g, m => m.split(/[\\/]/).filter(Boolean).pop() ?? ' ')
+    .replace(/[\x21-\x7e]{20,}/g, ' ')
+  const out: string[] = []
+  for (const m of plain.matchAll(/([ァ-ヶー]{2,10}|[一-龯々]{2,7}|[A-Za-z][A-Za-z0-9.+#-]{2,15})([ぁ-ん]?)/g)) {
+    let w = (m[1] ?? '').replace(/[.-]+$/, '')
+    const next = m[2] ?? ''
+    // 「種類足りない」の「足」のように、送り仮名の前の漢字は落とす（「自動生成して」のようなする動詞はそのまま）
+    const isSuru = SURU.includes(next) && !SU_VERB_KANJI.includes([...w].pop() ?? '')
+    if (/^[一-龯々]/.test(w) && next !== '' && !PARTICLES.includes(next) && !isSuru) w = [...w].slice(0, -1).join('')
+    if ([...w].length < 2 || w.startsWith('ー') || COMMON_WORDS.has(w.toLowerCase()) || out.includes(w)) continue
+    out.push(w)
+    if (out.length >= 6) break
+  }
+  return out
+}
+
+/** つぶやきに入れる、短いコマンド名（頭の cd や環境変数は飛ばして、最初の2語まで） */
+export function shortCommand(command: string): string {
+  const last = command.split(/&&|;|\|\|/).map(s => s.trim()).filter(s => s !== '' && !/^cd\s/.test(s))[0] ?? ''
+  const words = last.split(/\s+/).filter(w => !/^\w+=/.test(w))
+  const long = words[0] === 'npx' || words[0] === 'sudo' || words[1] === 'run'
+  const head = words.slice(0, long ? 3 : 2).filter(w => !w.startsWith('-') && !w.includes('/'))
+  return oneLine(head.join(' '), 14)
+}
+
+// ---- 盛り上がり ----
+
+/** ときどき何件かまとめて流れる、盛り上がりのコメント */
+export const WAVE_LINES: readonly Line[] = [
+  'うおおお', 'きたああ',
+  { text: 'いけえええ', color: orange },
+  { text: '神', color: purple, isBig: true },
+  'ここすき',
+  { text: '鳥肌', color: cyan },
+  { text: '熱い', color: red },
+  '！！！',
+  { text: '(ﾟ∀ﾟ)ｷﾀｺﾚ!!', color: yellow, isBig: true },
+  '88888',
+  { text: '８８８８８', color: yellow },
+  'ﾊﾟﾁﾊﾟﾁﾊﾟﾁ', 'ｗｗｗ', 'wwwwww', '草ｗｗｗ',
+  { text: 'ｗｗｗｗｗｗ', color: green },
+  'すげえええ', 'やばい', 'えぐい', 'つよすぎ', '震えた', '天才', 'ﾌｫｫｫｫ', 'ｶｯｹｪｪｪ', '祭りだああ', 'まじか',
+  '最高', '泣いた', '神展開', 'ｲｲﾈ!',
+  { text: '伝説の始まり', color: pink },
+  { text: 'ぶち上がる', color: blue },
+]
+
+/** 盛り上がり。n 件がまとめて流れる */
+export function wave(rand: Rand, n: number): Draft[] {
+  return pickSome(WAVE_LINES, n, rand).map(l => tint(draft(l), rand, 0.3))
+}
+
+// ---- 裏の作業（バックグラウンドのシェル・サブエージェント・ワークフロー） ----
+
+/** 裏で何かを走らせたとき */
+export const BG_LAUNCH_LINES: readonly Line[] = [
+  '裏で走らせた', 'バックグラウンド送り',
+  { text: '別働隊出撃', color: orange },
+  '放置プレイ開始', '並行作業きた', '裏方へGO', '仕込み完了', '投げっぱなしｗ', 'マルチタスク民',
+  '裏ルート開通',
+  { text: '水面下で始動', color: cyan },
+  '裏で何か始まった', 'ﾎﾟｲｯ', 'ながら作業きた',
+]
+
+/** ターンは終わったが、裏で作業が続いているとき */
+export const BG_START_LINES: readonly Line[] = [
+  { text: '延長戦', color: yellow },
+  'まだ終わりじゃない', '裏で続行中', '本番はこれから', '枠延長きた', 'アンコール待ち', '帰るのはまだ早い',
+  { text: '第二部開幕', color: orange },
+  'おつ…じゃなかった', '居残り組', 'Cパートあるやつ', '席立つなよ',
+]
+
+/** 裏の作業が終わるのを待っている間のつぶやき */
+export const BG_AMBIENT_LINES: readonly Line[] = [
+  '裏で作業中', '待ち時間', '進捗どう？', '放置ゲーかな', 'コーヒー淹れてくる', '分身たち元気？',
+  { text: '見守り隊', color: pink },
+  'ロード画面', 'まだかなー', '表は静か', 'ここ待合室？', '回ってる回ってる', '音沙汰なし', '生きてる？',
+  '耐久待機', '気長に待つ', 'カップ麺待ち', '裏方がんばれ',
+  { text: '果報は寝て待て', color: yellow },
+  'しりとりする？', '雑談タイム', 'BGMだけ流れてる', '配信者どこ行った', '画面止まってる？', 'ﾁｸﾀｸﾁｸﾀｸ',
+  '( ˘ω˘ )ｳﾄｳﾄ', '(´・ω・`)ﾋﾏ', '(´ー`)ﾏｯﾀﾘ', '(´-`).｡oO', '裏の様子見たい', 'プログレスバー欲しい',
+  '何%まで来た？', '今のうちに風呂', '飯食ってくる', '幕間', 'CMタイム', '放置で育つ', '待つのも仕事',
+  '裏で汗かいてそう', '焦らすねぇ',
+  { text: '待機列', color: cyan },
+  '今北、何待ち？', 'もうすぐかな', '通知まだ？', 'あと何分？', '舞台裏', 'ビルドって長いよね',
+  '歯磨きしてくる', '洗い物済ませとく', '待ってる間に一品作った', '麺伸びた', 'お湯沸いた', '猫が膝に乗った',
+  '犬の散歩行ってくる', 'ただいま、どうなった？', 'おかえり、まだだよ', '留守番してる', '中の人お茶してそう',
+  '小人さんが作業中', '舞台袖から音する', '(´ε｀ )', '(-ω-)ｸﾞｰ', '実況なしの時間', '止まってはないはず',
+  '環境映像', '焚き火動画の趣', '水槽眺めてる気分', 'どこから見てる？', 'こっちは北海道', '一旦離席',
+  '戻りました', '待機勢集合', '見てる鍋は煮えない', '寝かせるほど美味い', 'オーブン覗きたい', '発酵中',
+  '洗濯機の残り時間みたい', 'レンジの前で待つやつ', '時計見ちゃう', '1分が1時間', '終わったら起こして',
+  '通知オン済み', 'たぶん今70%', '体感あと5分', '「もうすぐ」は信用しない', '差し入れ置いとくね',
+  '栄養ドリンク置き配', '縁の下の力持ち', 'エンドロールに名前を', '表は平和、裏は戦場', '今のうちに宿題やる',
+  '好きなエディタ選手権', 'タブ派？スペース派？', 'vim派は挙手', '推し言語を語ろう', '隣の人こんばんは',
+  '点呼とろう', 'お座りして待つ', '整理券配布中', '番号札は42番', '合否発表前の気分', '成功しますように',
+  'ﾅﾑﾅﾑ', '誰か一発ギャグ', '静かすぎて不安', '裏の進捗を想像で補う', '放課後みたいな空気',
+  'エレベーター待ちの沈黙', 'アイス2本目', '二度寝チャンス', '待ってる人多くて草',
+  { text: '信じてるからな', color: cyan },
+  { text: 'スタッフさん感謝', color: pink },
+  { text: '静かなる戦い', color: purple },
+  'この画面もう暗記済み', 'ｳｨｰﾝ…', '見てない間に終われ', '晩ごはん報告会',
+]
+
+/** {n} は裏で動いている作業の数 */
+export const BG_COUNT_LINES: readonly Line[] = [
+  '裏で{n}個動いてる', '残り{n}',
+  { text: 'あと{n}件！', color: orange },
+  '{n}タスク待ち', '裏で{n}件稼働中', '待ち{n}件',
+]
+
+/** {n} が 2 以上のときだけ使う */
+export const BG_PARALLEL_LINES: readonly Line[] = [
+  '{n}並列で草', '{n}本同時進行', '分身{n}体稼働中', '裏に{n}人いる',
+  { text: '{n}窓配信', color: cyan },
+]
+
+/** 裏で動いている作業の数を言う */
+function bgCount(n: number, rand: Rand): Draft {
+  return draft(pick(n >= 2 ? [...BG_COUNT_LINES, ...BG_PARALLEL_LINES] : BG_COUNT_LINES, rand), { n: String(n) })
+}
+
+/** 裏の作業が終わった */
+export const BG_DONE_LINES: readonly Line[] = [
+  '完了通知きた', '裏組おつ', '帰還報告', '終わったー',
+  { text: '任務完了', color: green },
+  '待った甲斐あった', '放置勝ち', 'ﾋﾟｺｰﾝ', '結果発表きた', '無事帰ってきた', '片付いた',
+  { text: '裏ミッション達成', color: yellow },
+  '裏で終わってた', '一報きた',
+]
+
+/** 裏の作業が失敗した */
+export const BG_FAIL_LINES: readonly Line[] = [
+  '裏で事故ってて草', '失敗通知…', '撃沈', '帰ってこなかった',
+  { text: '殉職', color: purple },
+  '裏で爆発してる',
+  { text: '【悲報】裏で失敗', color: red },
+  '見てないとこでコケた', '散ったか…', 'ログ確認はよ', '別働隊全滅', '(´；ω；`)',
+]
+
+/** 裏の作業が止められた */
+export const BG_KILLED_LINES: readonly Line[] = [
+  '強制送還ｗ', '打ち切りエンド', '止められた', 'お役御免', '裏方クビで草', '解散！',
+  { text: 'KILL', color: red },
+  '撤収', '安らかに',
+]
+
+/** 裏の作業からの、終わったのではない知らせ（モニターの通知など） */
+export const BG_NOTICE_LINES: readonly Line[] = ['通知きた', '何か来た', '報告きた', '動きあり', '続報きた', 'お知らせ']
+
+/**
+ * 終わらない裏方（開発サーバー・watch・tail -f など）のコマンドか。こういうものは待ち時間に数えない。
+ * /dev/null への付け替えや、cd などの前置きは見ずに、最後のコマンドだけで決める
+ */
+const PERSISTENT_RE =
+  /(?<![\w/.:@-])(?:dev|serve|server|runserver|start|preview|watch)(?![\w/:-])|\b(?:start|serve|dev):(?:dev|watch|debug|local)\b|--watch(?:All)?\b(?!=false)|--reload\b|\b(?:tsc|tsx|esbuild|webpack|rollup|babel|sass|tailwindcss)\b[^;&|]*\s-w\b|\btail\s+-[fF]\b|(?<![\w-])(?:nodemon|live-server|vite(?!\s+build)|uvicorn|gunicorn|flask\s+run|streamlit\s+run|rails\s+s(?:erver)?|jupyter|ngrok|storybook(?!\s+build)|docker[ -]compose\s+up(?![^;&|]*\s-d\b))\b|\bhttp\.server\b|\bphp\s+-S\b/
+
+export function isPersistentCommand(command: string): boolean {
+  const last = command.replace(/\d?>>?\s*\/dev\/null/g, '').split(/&&|;|\|\|/).pop() ?? ''
+  return PERSISTENT_RE.test(last)
+}
+
+/** 裏に回る呼び出しか。Agent は止めない限り裏で動く */
+export function isBackgroundLaunch(tool: string, input: Readonly<Record<string, unknown>>): boolean {
+  if (tool === 'Workflow' || tool === 'Monitor') return true
+  if (tool === 'Agent') return input.run_in_background !== false
+  return input.run_in_background === true
+}
+
+export function reactToBackgroundLaunch(rand: Rand): Draft[] {
+  return [tint(draft(pick(BG_LAUNCH_LINES, rand)), rand)]
+}
+
+/** ターンの終わりに、裏でまだ n 個の作業が動いているとき */
+export function reactToBackgroundStart(n: number, rand: Rand): Draft[] {
+  const out = [draft(pick(BG_START_LINES, rand))]
+  if (rand() < 0.5) out.push(bgCount(n, rand))
+  return out
+}
+
+/** 終わったことを表す状態 */
+const FINISHED: ReadonlySet<string> = new Set(['completed', 'failed', 'error', 'killed', 'stopped', 'cancelled', 'canceled'])
+
+export type TaskNotice = { id: string | undefined; status: string; isFinished: boolean }
+
+/** 裏の作業の知らせ（<task-notification>）から、どの作業がどうなったかを読む */
+export function parseTaskNotification(text: string): TaskNotice {
+  const id = /<task-id>\s*([^<\s]+)\s*<\/task-id>/.exec(text)?.[1]
+  const status = (/<status>\s*([^<\s]+)\s*<\/status>/.exec(text)?.[1] ?? '').toLowerCase()
+  return { id, status, isFinished: FINISHED.has(status) }
+}
+
+export function reactToTaskNotification(status: string, rand: Rand): Draft[] {
+  const lines =
+    status === 'completed'
+      ? BG_DONE_LINES
+      : status === 'failed' || status === 'error'
+        ? BG_FAIL_LINES
+        : FINISHED.has(status)
+          ? BG_KILLED_LINES
+          : BG_NOTICE_LINES
   return [tint(draft(pick(lines, rand)), rand)]
 }
 
@@ -1542,14 +2230,31 @@ export function aiPrompt(answer: string, n: number): string {
   ].join('\n')
 }
 
+/** 作業中の実況（aiChatter）。いままでの作業の様子を見せて、視聴者のコメントを書いてもらう */
+export function chatterPrompt(activity: readonly string[], n: number): string {
+  return [
+    'あなたはニコニコ動画の生放送を見ている、いろいろな視聴者の集団です。配信者はAIアシスタントの「Claude」で、いまユーザーの依頼で作業しています。',
+    '',
+    '<作業の様子（古い順）>',
+    ...activity.slice(-15).map(line => `- ${line}`),
+    '</作業の様子>',
+    '',
+    `この様子を見ている視聴者が画面に流すコメントを${n}個書いてください。`,
+    '- 1行に1コメント。番号・記号・かぎかっこ・説明は付けない',
+    '- 各コメントは2〜16文字。作業の具体的な中身（ファイル名、コマンド、エラー、お題の言葉）に触れるものを半分以上にする',
+    '- 実況・ツッコミ・質問・応援・雑談・あるある・自分語りなど、別々の人が書いたように口調と長さと語尾をばらばらにする',
+    '- 「草」「ｗ」で終わるのは2個まで。誹謗中傷や下品な表現は書かない',
+  ].join('\n')
+}
+
 const AI_COLORS: ReadonlyArray<string | null> = [null, null, null, pink, cyan, orange, green]
 
-export function parseAiLines(text: string, rand: Rand): Draft[] {
+export function parseAiLines(text: string, rand: Rand, max = 8): Draft[] {
   return text
     .split(/\r?\n/)
     .map(line => line.replace(/^\s*(?:[-*・•]|\d+[.)．]|[「『"])\s*/, '').replace(/[」』"]\s*$/, '').trim())
     .filter(line => line !== '' && !line.startsWith('<'))
-    .slice(0, 8)
+    .slice(0, max)
     .map(line => ({ text: oneLine(line, 20), color: pick(AI_COLORS, rand) }))
 }
 

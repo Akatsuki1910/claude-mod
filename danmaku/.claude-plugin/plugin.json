@@ -1,6 +1,6 @@
 {
   "name": "danmaku",
-  "version": "0.2.0",
+  "version": "0.4.0",
   "description": "Claudeの作業に合わせて、プロンプトの上にニコニコ風の弾幕コメントを流す",
   "author": {
     "name": "akatsuki1910"
@@ -41,6 +41,12 @@
       "type": "boolean",
       "title": "AI視聴者",
       "description": "ターン終了時、Haiku が Claude の回答を読んで反応コメントを流す（1ターンにつき小さな API 呼び出し1回）",
+      "default": false
+    },
+    "aiChatter": {
+      "type": "boolean",
+      "title": "AI実況",
+      "description": "作業中も、Haiku がいまの作業（お題・さわったファイル・コマンド）を見て実況コメントを書く。新しい動きがあるときだけ、約90秒に1回の小さな API 呼び出し",
       "default": false
     }
   }

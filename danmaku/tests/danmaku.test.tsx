@@ -25,6 +25,13 @@ import * as lines from '../hooks/lines'
 import {
   AFTER_ERROR_LINES,
   BASH_SPECIAL,
+  BG_AMBIENT_LINES,
+  BG_COUNT_LINES,
+  BG_DONE_LINES,
+  BG_FAIL_LINES,
+  BG_LAUNCH_LINES,
+  BG_PARALLEL_LINES,
+  BG_START_LINES,
   COLORS,
   COMBO_BY_GROUP,
   COMBO_LINES,
@@ -43,11 +50,17 @@ import {
   THINKING_LINES,
   TIME_LINES,
   TOUGH_TURN_LINES,
+  WAVE_LINES,
   ambient,
+  isBackgroundLaunch,
+  isPersistentCommand,
+  parseTaskNotification,
   parseUserComment,
   reactToPrompt,
   reactToToolEnd,
+  reactToBackgroundStart,
   reactToTurnEnd,
+  testFailed,
 } from '../hooks/lines'
 import type { Draft, Line } from '../hooks/lines'
 
@@ -100,6 +113,13 @@ const texts = (list: ReadonlyArray<string | Draft>): string[] => list.map(l => (
 const filled = (list: ReadonlyArray<string | Draft>, vars: Record<string, string>): string[] =>
   texts(list).map(t => t.replace(/\{(\w+)\}/g, (_, key: string) => vars[key] ?? ''))
 
+/** pool のコメントそのものか、語尾や頭に言葉が足されたもの（lines.vary）か */
+const isFrom = (list: ReadonlyArray<string | Draft>, vars: Record<string, string> = {}) => {
+  const bases = filled(list, vars)
+  return (text: string) =>
+    bases.some(b => text === b || text === b + b || lines.SUFFIXES.some(x => text === b + x) || lines.PREFIXES.some(x => text === x + b))
+}
+
 const runCommand = ($: Engine, args: string) =>
   $.command.run({ command: 'danmaku', args, origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 80 } })
 
@@ -112,10 +132,12 @@ function band(isWorking: boolean, bodyColumns = 60) {
   }
 }
 
-/** エンジンの代わり: 時計とストアはメモリ、帯にはエンジン自身は何も描かない */
+/** エンジンの代わり: 時計とストアはメモリ、帯にはエンジン自身は何も描かない。設定の Stop フックはない */
 function world(on: On) {
   const clock = mock.clock(on, { now: 1_000_000 })
   mock.store(on)
+  on('classic.Stop', () => ({}))
+  on('classic.SubagentStop', () => ({}))
   on('ui.render', ($, e) => {
     const { Box } = $.ui.resolve(e)
     return <Box key="engine" />
@@ -144,6 +166,28 @@ function freshOnAir($: Engine): () => Promise<string[]> {
     return out
   }
 }
+
+/** classic.Stop が渡す、裏で動いている作業 */
+const bgTask = (id: string, type: string, command?: string) => ({
+  id,
+  type,
+  status: 'running',
+  description: command ?? id,
+  ...(command === undefined ? {} : { command }),
+})
+
+/** 裏の作業が終わったときに届く知らせ */
+const notice = (id: string, status: string) =>
+  `<task-notification>\n<task-id>${id}</task-id>\n<status>${status}</status>\n<summary>done</summary>\n</task-notification>`
+
+/** 裏の作業を待っているときに流れうるコメント（{n} は 1〜3） */
+const BG_TEXTS = [
+  ...texts(BG_AMBIENT_LINES),
+  ...texts(BG_START_LINES),
+  ...['1', '2', '3'].flatMap(n => filled(BG_COUNT_LINES, { n })),
+  ...['2', '3'].flatMap(n => filled(BG_PARALLEL_LINES, { n })),
+]
+const isBgText = isFrom(BG_TEXTS)
 
 /** {n} にありそうな回数を入れた本文すべて */
 const anyN = (list: readonly Line[]) => [1, 2, 3, 5, 8, 9, 10, 11, 12, 20].flatMap(n => filled(list, { n: String(n), tool: 'Read' }))
@@ -464,7 +508,7 @@ describe('lines', () => {
     expect(texts(DENIED_LINES)).toContain(denied[0]!.text)
   })
   test('ネタ帳はどれも空でなく、短く、描けない文字や置き換え忘れがない', () => {
-    const vars = { file: 'login.test.ts', cmd: 'npm run build', q: 'TODO', tool: 'Read', n: '12', min: '10' }
+    const vars = { file: 'login.test.ts', cmd: 'npm run build', q: 'TODO', tool: 'Read', n: '12', min: '10', topic: 'ログイン' }
     const pools: Array<[string, readonly Line[]]> = []
     const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null
     for (const [name, value] of Object.entries(lines)) {
@@ -546,16 +590,77 @@ describe('lines', () => {
     const quiet = reactToTurnEnd({ reason: 'answer', durationMs: 20_000, tools: 0, errors: 3 }, half).map(d => d.text)
     expect(quiet.some(t => texts(NO_TOOLS_LINES).includes(t))).toBe(true)
     expect(quiet.some(t => texts(TOUGH_TURN_LINES).includes(t))).toBe(true)
-    expect(quiet.some(t => texts(OTSU_LINES).includes(t))).toBe(true)
+    expect(quiet.some(isFrom(OTSU_LINES))).toBe(true)
     const r = () => 0
     const base = { elapsedMs: 10_000, tools: 3, isErrorRecent: false, isBusy: false }
-    expect(texts(AFTER_ERROR_LINES)).toContain(ambient(r, { ...base, isErrorRecent: true })[0]!.text)
-    expect(texts(THINKING_LINES)).toContain(ambient(r, { ...base, tools: 0 })[0]!.text)
+    expect(isFrom(AFTER_ERROR_LINES)(ambient(r, { ...base, isErrorRecent: true })[0]!.text)).toBe(true)
+    expect(isFrom(THINKING_LINES)(ambient(r, { ...base, tools: 0 })[0]!.text)).toBe(true)
     expect(ambient(r)).toHaveLength(1)
   })
 
+  test('裏の作業の知らせを読み、裏に回る呼び出しを見分ける', () => {
+    expect(parseTaskNotification(notice('wjdmcc8dm', 'completed'))).toEqual({ id: 'wjdmcc8dm', status: 'completed', isFinished: true })
+    expect(parseTaskNotification(notice('b2', 'FAILED'))).toEqual({ id: 'b2', status: 'failed', isFinished: true })
+    expect(parseTaskNotification('<task-notification><task-id>m1</task-id><event>ok</event></task-notification>')).toEqual({
+      id: 'm1',
+      status: '',
+      isFinished: false,
+    })
+    expect(isBackgroundLaunch('Bash', { command: 'npm run build', run_in_background: true })).toBe(true)
+    expect(isBackgroundLaunch('Bash', { command: 'npm run build' })).toBe(false)
+    expect(isBackgroundLaunch('Agent', { prompt: 'x' })).toBe(true)
+    expect(isBackgroundLaunch('Agent', { prompt: 'x', run_in_background: false })).toBe(false)
+    expect(isBackgroundLaunch('Workflow', {})).toBe(true)
+  })
+
+  test('終わらない裏方（開発サーバーなど）だけを見分け、テストの出力から失敗に気づく', () => {
+    for (const command of ['npm run dev', 'npm start', 'npx vite', 'docker compose up', 'rails s', 'python manage.py runserver', 'tsc -w', 'npx jest --watchAll', 'tail -f app.log', 'cd web && npm run dev']) {
+      expect([command, isPersistentCommand(command)]).toEqual([command, true])
+    }
+    for (const command of ['npm test > /dev/null 2>&1', 'cd server && npm test', 'go test ./server/...', 'npm run build:dev', 'npx vite build', 'docker compose up -d', 'npm run test -- --watch=false', 'until grep -q Ready dev.log; do sleep 1; done']) {
+      expect([command, isPersistentCommand(command)]).toEqual([command, false])
+    }
+    expect(testFailed('Tests  2 failed | 10 passed')).toBe(true)
+    expect(testFailed(' FAIL  src/a.test.ts')).toBe(true)
+    expect(testFailed('Tests  12 passed\n0 failed')).toBe(false)
+  })
+
+  test('お題から言葉を拾い、コマンドを短くする', () => {
+    expect(lines.extractTopics('弾幕の種類足りないから増やして欲しい')).toEqual(['弾幕', '種類'])
+    expect(lines.extractTopics('ログインのバグを直して')).toEqual(['ログイン', 'バグ'])
+    expect(lines.extractTopics('Fix the README for the danmaku plugin')).toEqual(['README', 'danmaku', 'plugin'])
+    expect(lines.shortCommand('cd src && npm run build -- --watch')).toBe('npm run build')
+    expect(lines.shortCommand('NODE_ENV=test npx vitest run')).toBe('npx vitest run')
+    expect(lines.shortCommand('git status')).toBe('git status')
+    expect(lines.shortCommand('python3 scripts/gen.py')).toBe('python3')
+  })
+
+  test('言い回しのゆらぎは、もとの文を残したまま語尾か頭に足すだけで、お題や顔文字や壁にはさわらない', () => {
+    let seed = 3
+    const r = () => (seed = (seed * 48271) % 2147483647) / 2147483647
+    for (let i = 0; i < 300; i++) {
+      const d = lines.vary({ text: 'おつかれ' }, r)
+      expect(isFrom(['おつかれ'])(d.text)).toBe(true)
+      for (const text of ['【お題】ログイン', '$ npm test', '(・∀・)', 'ｗｗｗｗｗｗｗ', 'わかる？', 'テスト落ちてて草']) {
+        expect(lines.vary({ text }, r).text).toBe(text)
+      }
+      expect(lines.vary({ text: 'わこつ', pos: 'ue' }, r).text).toBe('わこつ')
+    }
+  })
+
+  test('裏の作業が1つだけのときは「並列」のような言い方をしない', () => {
+    let seed = 1
+    const r = () => (seed = (seed * 48271) % 2147483647) / 2147483647
+    const parallel = filled(BG_PARALLEL_LINES, { n: '1' })
+    for (let i = 0; i < 500; i++) {
+      for (const d of reactToBackgroundStart(1, r)) expect(parallel).not.toContain(d.text)
+      const [d] = ambient(r, { elapsedMs: 0, tools: 0, isErrorRecent: false, isBusy: false, isBackground: true, backgroundTasks: 1 })
+      expect(parallel).not.toContain(d!.text)
+    }
+  })
+
   test('ツールの種類ごとのネタ帳は toolGroup の名前で引け、成功したツールにはほめ言葉がある', () => {
-    const tools = ['Read', 'Edit', 'Write', 'Bash', 'Grep', 'WebFetch', 'Agent', 'TodoWrite', 'AskUserQuestion', 'ExitPlanMode', 'Skill', 'mcp__x__y', 'Zzz']
+    const tools = ['Read', 'Edit', 'Write', 'Bash', 'Grep', 'WebFetch', 'Agent', 'TodoWrite', 'AskUserQuestion', 'ExitPlanMode', 'Skill', 'Workflow', 'Monitor', 'mcp__x__y', 'Zzz']
     const groups = new Set(tools.map(lines.toolGroup))
     const tables = [
       ['TOOL_LINES', lines.TOOL_LINES],
@@ -567,7 +672,7 @@ describe('lines', () => {
     }
     const ok = lines.reactToToolOk('Read', { file_path: '/a/b.ts' }, () => 0)
     expect(ok).toHaveLength(1)
-    expect(filled(lines.TOOL_OK_LINES.Read ?? [], { file: 'b.ts' })).toContain(ok[0]!.text)
+    expect(isFrom(lines.TOOL_OK_LINES.Read ?? [], { file: 'b.ts' })(ok[0]!.text)).toBe(true)
   })
 })
 
@@ -709,7 +814,7 @@ describe('events', () => {
     const value = await onAir($)
     const said = value.map(c => c.text)
     const special = BASH_SPECIAL.find(s => s.re.test('npm test'))!
-    expect(said.some(t => texts(special.start).includes(t))).toBe(true)
+    expect(said.some(isFrom(special.start))).toBe(true)
     expect(said.some(t => texts(special.ng!).includes(t))).toBe(true)
   })
 
@@ -757,7 +862,7 @@ describe('events', () => {
     expect(await onAir($)).toHaveLength(0)
     await $.turn.complete({ answer: 'done', durationMs: 20_000, isAborted: false, turnId: 't1', reason: 'answer' })
     const value = await onAir($)
-    expect(value.some(c => texts(OTSU_LINES).includes(c.text))).toBe(true)
+    expect(value.some(c => isFrom(OTSU_LINES)(c.text))).toBe(true)
   })
 
   test('AI視聴者をオンにすると、回答に反応したコメントが流れる', { options: { aiViewers: true } }, async ($, on) => {
@@ -773,29 +878,52 @@ describe('events', () => {
     expect(said).toContain('ログイン直ってて草')
     expect(said).toContain('有能')
   })
-  // 静かになってから QUIET_MS（の 0.75〜1.25 倍）たった次の見回り（250ms ごと）でつぶやく
-  for (const [density, min, max] of [
-    ['low', 3500, 5750],
-    ['normal', 2000, 3250],
-    ['high', 1000, 1500],
+  // 画面を流れているコメント（横切る 5 秒の 8 割より新しいもの）が density ごとの数を下回ったら、
+  // 前のコメントから 4 秒 / その数（の 0.75〜1.25 倍）空けて、次の見回り（250ms ごと）でつぶやく
+  for (const [density, floor, minGap] of [
+    ['low', 1, 3000],
+    ['normal', 3, 1000],
+    ['high', 5, 750],
   ] as const) {
-    test(`作業中は静かになっても途切れず、density ${density} ではつぶやきの間隔が ${min}〜${max}ms`, { options: { density } }, async ($, on) => {
+    test(`作業中は静かでも弾幕が途切れず、density ${density} では ${floor} 件ほど流れ続ける`, { options: { density }, timeoutMs: 30_000 }, async ($, on) => {
       const clock = world(on)
       on('turn.start', (_$, e) => ({ turnId: e.turnId }))
       await $.turn.start({ text: '調べて', turnId: 't1' })
       const ats = new Set<number>()
-      for (let t = 0; t < 40_000; t += 1000) {
+      // 盛り上がり（40秒より後）が入らないところまで見る
+      for (let t = 1000; t <= 38_000; t += 1000) {
         await clock.advance(1000)
-        for (const c of await onAir($)) ats.add(c.at)
+        const now = clock.now()
+        const live = await onAir($)
+        for (const c of live) ats.add(c.at)
+        if (t >= 6000) {
+          const flowing = live.filter(c => c.pos === 'naka' && now - c.at < 5000).length
+          expect([density, t, flowing >= Math.max(1, floor - 1)]).toEqual([density, t, true])
+        }
       }
       const sorted = [...ats].sort((a, b) => a - b)
-      expect(sorted.length).toBeGreaterThan(40_000 / max - 1)
       for (let k = 1; k < sorted.length; k++) {
-        expect(sorted[k]! - sorted[k - 1]!).toBeGreaterThanOrEqual(min)
-        expect(sorted[k]! - sorted[k - 1]!).toBeLessThanOrEqual(max)
+        expect(sorted[k]! - sorted[k - 1]!).toBeGreaterThanOrEqual(minGap)
+        expect(sorted[k]! - sorted[k - 1]!).toBeLessThanOrEqual(5000)
       }
     })
   }
+
+  test('作業中はときどき盛り上がって、何件かまとめて流れる', { timeoutMs: 30_000 }, async ($, on) => {
+    const clock = world(on)
+    on('turn.start', (_$, e) => ({ turnId: e.turnId }))
+    await $.turn.start({ text: '調べて', turnId: 't1' })
+    const waves = texts(WAVE_LINES)
+    const byAt = new Map<number, Set<string>>()
+    for (let t = 0; t < 85_000; t += 1000) {
+      await clock.advance(1000)
+      for (const c of await onAir($)) {
+        if (!waves.includes(c.text)) continue
+        byAt.set(c.at, new Set([...(byAt.get(c.at) ?? []), c.text]))
+      }
+    }
+    expect([...byAt.values()].some(set => set.size >= 3)).toBe(true)
+  })
 
   test('作業が1分を超えると経過時間を言い、ターンが終わるとつぶやきは止まる', async ($, on) => {
     const clock = world(on)
@@ -947,5 +1075,333 @@ describe('events', () => {
     expect(said).toContain('AI視聴者その2')
     expect(said.some(t => texts(lines.LONG_TURN_LINES).includes(t))).toBe(true)
     expect(said.some(t => texts(TOUGH_TURN_LINES).includes(t))).toBe(true)
+  })
+  test('ターンが終わっても裏の作業が続いている間はつぶやき続け、終わった知らせで止まる', async ($, on) => {
+    const clock = world(on)
+    on('turn.start', (_$, e) => ({ turnId: e.turnId }))
+    on('turn.complete', (_$, e) => ({ text: e.answer }))
+    on('prompt.submit', (_$, e) => ({ text: e.text }))
+    const fresh = freshOnAir($)
+    await $.turn.start({ text: 'ビルドして', turnId: 't1' })
+    await $.turn.complete({ answer: '裏でビルドしています', durationMs: 20_000, isAborted: false, turnId: 't1', reason: 'answer' })
+    await $.classic.Stop({ stop_hook_active: false, background_tasks: [bgTask('b1', 'shell', 'npm run build')] })
+    await clock.advance(3000)
+    await fresh()
+    const said: string[] = []
+    for (let t = 0; t < 30_000; t += 1000) {
+      await clock.advance(1000)
+      said.push(...(await fresh()))
+    }
+    // 静かになっても、裏の作業を待つ間は流れ続ける
+    expect(said.length).toBeGreaterThan(10)
+    expect(said.some(t => isBgText(t))).toBe(true)
+    for (const surface of SURFACES) {
+      const ui = await $.ui.mount({ ...band(false), surface })
+      expect(await ui.find({ type: 'Client' })).toBeDefined()
+      await ui.unmount()
+    }
+    await $.prompt.submit({ text: notice('b1', 'completed'), origin: { kind: 'task-notification' }, wait: false })
+    expect((await fresh()).some(t => texts(BG_DONE_LINES).includes(t))).toBe(true)
+    await clock.advance(20_000)
+    expect(await onAir($)).toHaveLength(0)
+    for (const surface of SURFACES) {
+      const ui = await $.ui.mount({ ...band(false), surface })
+      expect(await ui.find({ type: 'Client' })).toBeUndefined()
+      await ui.unmount()
+    }
+  })
+
+  test('裏の作業が失敗した知らせにも反応する', async ($, on) => {
+    world(on)
+    on('prompt.submit', (_$, e) => ({ text: e.text }))
+    await $.classic.Stop({ stop_hook_active: false, background_tasks: [bgTask('b2', 'shell', 'npm test')] })
+    await $.prompt.submit({ text: notice('b2', 'failed'), origin: { kind: 'task-notification' }, wait: false })
+    expect((await onAir($)).some(c => texts(BG_FAIL_LINES).includes(c.text))).toBe(true)
+  })
+
+  test('開発サーバーのような終わらない裏方は、待たない', async ($, on) => {
+    const clock = world(on)
+    on('turn.start', (_$, e) => ({ turnId: e.turnId }))
+    on('turn.complete', (_$, e) => ({ text: e.answer }))
+    await $.turn.start({ text: 'サーバー立てて', turnId: 't1' })
+    await $.turn.complete({ answer: '起動しました', durationMs: 20_000, isAborted: false, turnId: 't1', reason: 'answer' })
+    await $.classic.Stop({ stop_hook_active: false, background_tasks: [bgTask('s1', 'shell', 'npm run dev'), bgTask('s2', 'shell', 'tail -f app.log')] })
+    await clock.advance(15_000)
+    expect(await onAir($)).toHaveLength(0)
+  })
+
+  test('裏のサブエージェントが終わったら、一覧を見て気づいて止まる', async ($, on) => {
+    const clock = world(on)
+    let status = 'running'
+    on('agent.list', () => ({ value: [{ id: 'a1', description: '調査', type: 'Explore', status }] }))
+    on('turn.start', (_$, e) => ({ turnId: e.turnId }))
+    on('turn.complete', (_$, e) => ({ text: e.answer }))
+    await $.turn.start({ text: '調べて', turnId: 't1' })
+    await $.turn.complete({ answer: '調べています', durationMs: 20_000, isAborted: false, turnId: 't1', reason: 'answer' })
+    await $.classic.Stop({ stop_hook_active: false, background_tasks: [bgTask('a1', 'subagent')] })
+    await clock.advance(20_000)
+    expect((await onAir($)).length).toBeGreaterThan(0)
+    status = 'completed'
+    await clock.advance(6000)
+    await clock.advance(10_000)
+    expect(await onAir($)).toHaveLength(0)
+  })
+
+  test('ターンの終わりにワークフローが動いていれば、終わった知らせまでつぶやく', async ($, on) => {
+    const clock = world(on)
+    on('turn.start', (_$, e) => ({ turnId: e.turnId }))
+    on('turn.complete', (_$, e) => ({ text: e.answer }))
+    on('prompt.submit', (_$, e) => ({ text: e.text }))
+    on('tool.call', () => ({ result: 'ok', text: 'ok' }))
+    await $.turn.start({ text: '調べて', turnId: 't1' })
+    await $.turn.complete({ answer: '調べています', durationMs: 20_000, isAborted: false, turnId: 't1', reason: 'answer' })
+    await $.classic.Stop({ stop_hook_active: false, background_tasks: [bgTask('w1', 'workflow')] })
+    await $.tool.call({ tool: 'Read', file_path: '/src/a.ts', agentId: 'wf-agent' })
+    await clock.advance(20_000)
+    expect((await onAir($)).length).toBeGreaterThan(0)
+    await $.prompt.submit({ text: notice('w1', 'completed'), origin: { kind: 'task-notification' }, wait: false })
+    await clock.advance(30_000)
+    expect(await onAir($)).toHaveLength(0)
+  })
+
+  test('裏に回すと反応し、テストが通ると盛り上がる', async ($, on) => {
+    const clock = world(on)
+    on('tool.call', () => ({ result: 'ok', text: 'ok' }))
+    await $.tool.call({ tool: 'Bash', command: 'npm run build', run_in_background: true })
+    expect((await onAir($)).some(c => texts(BG_LAUNCH_LINES).includes(c.text))).toBe(true)
+    await clock.advance(2500)
+    await $.tool.call({ tool: 'Bash', command: 'npm test' })
+    expect((await onAir($)).filter(c => texts(WAVE_LINES).includes(c.text)).length).toBeGreaterThanOrEqual(2)
+  })
+
+  test('裏に回したテストや、出力に失敗があるテストでは盛り上がらない', async ($, on) => {
+    const clock = world(on)
+    on('tool.call', (_$, e) =>
+      String((e as { command?: unknown }).command).includes('tail')
+        ? { result: 'Tests  2 failed | 10 passed', text: 'Tests  2 failed | 10 passed' }
+        : { result: 'Command running in background', text: 'Command running in background' },
+    )
+    const special = BASH_SPECIAL.find(s => s.re.test('npm test'))!
+    const waves = texts(WAVE_LINES).filter(t => !texts(special.ok ?? []).includes(t))
+    const fresh = freshOnAir($)
+    await $.tool.call({ tool: 'Bash', command: 'npm test', run_in_background: true })
+    const launched = await fresh()
+    expect(launched.filter(t => waves.includes(t) || texts(special.ok ?? []).includes(t))).toEqual([])
+    await clock.advance(2500)
+    await $.tool.call({ tool: 'Bash', command: 'npx vitest run 2>&1 | tail -40' })
+    const piped = await fresh()
+    expect(piped.filter(t => waves.includes(t))).toEqual([])
+    expect(piped.some(t => texts(special.ng ?? []).includes(t))).toBe(true)
+  })
+  test('しばらくは同じコメントを繰り返さない', { timeoutMs: 60_000 }, async ($, on) => {
+    const clock = world(on)
+    on('turn.start', (_$, e) => ({ turnId: e.turnId }))
+    on('prompt.submit', (_$, e) => ({ text: e.text }))
+    await $.prompt.submit({ text: 'ログインのバグを直して', origin: { kind: 'composer' }, wait: false })
+    await $.turn.start({ text: 'ログインのバグを直して', turnId: 't1' })
+    const fresh = freshOnAir($)
+    const said: string[] = []
+    for (let t = 0; t < 10 * 60_000; t += 1000) {
+      await clock.advance(1000)
+      said.push(...(await fresh()))
+    }
+    expect(said.length).toBeGreaterThan(300)
+    // 直前の 60 件と同じコメントは、ほとんど出ない
+    const repeats = said.filter((t, i) => said.slice(Math.max(0, i - 60), i).includes(t)).length
+    expect(repeats / said.length).toBeLessThan(0.05)
+    expect(new Set(said).size / said.length).toBeGreaterThan(0.6)
+  })
+
+  test('お題の言葉やさわっているファイルにも触れる', { timeoutMs: 30_000 }, async ($, on) => {
+    const clock = world(on)
+    on('turn.start', (_$, e) => ({ turnId: e.turnId }))
+    on('prompt.submit', (_$, e) => ({ text: e.text }))
+    on('tool.call', () => ({ result: 'ok', text: 'ok' }))
+    await $.prompt.submit({ text: 'ログインのバグを直して', origin: { kind: 'composer' }, wait: false })
+    await $.turn.start({ text: 'ログインのバグを直して', turnId: 't1' })
+    await $.tool.call({ tool: 'Read', file_path: '/src/auth/session.ts' })
+    const fresh = freshOnAir($)
+    const said: string[] = []
+    for (let t = 0; t < 90_000; t += 1000) {
+      await clock.advance(1000)
+      said.push(...(await fresh()))
+    }
+    const about = said.filter(t => !t.startsWith('【') && (t.includes('ログイン') || t.includes('バグ') || t.includes('session.ts')))
+    expect(about.length).toBeGreaterThan(2)
+  })
+
+  test('AI実況をオンにすると、作業中にいまの様子へのコメントが混ざる。間隔はあける', { options: { aiChatter: true }, timeoutMs: 30_000 }, async ($, on) => {
+    const clock = world(on)
+    let calls = 0
+    let prompt = ''
+    const usage = { input_tokens: 10, output_tokens: 10, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
+    on('model.complete', (_$, e) => {
+      calls += 1
+      prompt = String((e as { prompt?: unknown }).prompt)
+      return { value: { isAnswered: true as const, text: `session.ts読んでる${calls}\nログインまだ？${calls}\n3. 直りそう${calls}`, usage } }
+    })
+    on('turn.start', (_$, e) => ({ turnId: e.turnId }))
+    on('prompt.submit', (_$, e) => ({ text: e.text }))
+    on('tool.call', () => ({ result: 'ok', text: 'ok' }))
+    await $.prompt.submit({ text: 'ログインのバグを直して', origin: { kind: 'composer' }, wait: false })
+    await $.turn.start({ text: 'ログインのバグを直して', turnId: 't1' })
+    await $.tool.call({ tool: 'Read', file_path: '/src/auth/session.ts' })
+    const fresh = freshOnAir($)
+    const said: string[] = []
+    for (let t = 0; t < 200_000; t += 1000) {
+      await clock.advance(1000)
+      said.push(...(await fresh()))
+      if (t === 100_000) await $.tool.call({ tool: 'Bash', command: 'npm test' })
+    }
+    expect(prompt).toContain('session.ts')
+    expect(prompt).toContain('ログインのバグを直して')
+    expect(said.some(t => t.startsWith('session.ts読んでる'))).toBe(true)
+    expect(said).toContain('直りそう1')
+    // 90 秒おき、新しい動きがあったときだけ
+    expect(calls).toBeGreaterThanOrEqual(2)
+    expect(calls).toBeLessThanOrEqual(3)
+  })
+
+  test('AI実況がオフなら、作業中に AI を呼ばない', { timeoutMs: 30_000 }, async ($, on) => {
+    const clock = world(on)
+    let calls = 0
+    on('model.complete', () => {
+      calls += 1
+      return { value: { isAnswered: false as const, reason: 'off' } }
+    })
+    on('turn.start', (_$, e) => ({ turnId: e.turnId }))
+    await $.turn.start({ text: '調べて', turnId: 't1' })
+    await clock.advance(200_000)
+    expect(calls).toBe(0)
+  })
+})
+
+describe('background', () => {
+  const endTurn = ($: Engine, turnId = 't1') =>
+    $.turn.complete({ answer: 'x', durationMs: 20_000, isAborted: false, turnId, reason: 'answer' })
+  const setup = (on: On) => {
+    const clock = world(on)
+    on('turn.start', (_$, e) => ({ turnId: e.turnId }))
+    on('turn.complete', (_$, e) => ({ text: e.answer }))
+    on('prompt.submit', (_$, e) => ({ text: e.text }))
+    on('tool.call', () => ({ result: 'ok', text: 'ok' }))
+    return clock
+  }
+
+  test('Stop が turn.complete より先に来ても、裏の作業を待ってつぶやく', async ($, on) => {
+    const clock = setup(on)
+    const fresh = freshOnAir($)
+    await $.turn.start({ text: 'x', turnId: 't1' })
+    await $.classic.Stop({ stop_hook_active: false, background_tasks: [bgTask('b1', 'shell', 'npm run build')] })
+    await endTurn($)
+    await clock.advance(3000)
+    expect((await fresh()).some(t => isBgText(t))).toBe(true)
+    await clock.advance(20_000)
+    expect((await onAir($)).length).toBeGreaterThan(0)
+  })
+
+  test('ターン中に届いた知らせと、空の Stop で止まる', async ($, on) => {
+    const clock = setup(on)
+    await $.classic.Stop({ stop_hook_active: false, background_tasks: [bgTask('b1', 'shell', 'npm run build')] })
+    await $.turn.start({ text: 'x', turnId: 't1' })
+    await $.prompt.submit({ text: notice('b1', 'completed'), origin: { kind: 'task-notification' }, wait: false })
+    await clock.advance(5000)
+    await endTurn($)
+    await $.classic.Stop({ stop_hook_active: false, background_tasks: [] })
+    await clock.advance(20_000)
+    expect(await onAir($)).toHaveLength(0)
+  })
+
+  test('SubagentStop で裏のサブエージェントが外れたら止まる', async ($, on) => {
+    const clock = setup(on)
+    await $.classic.Stop({ stop_hook_active: false, background_tasks: [bgTask('a1', 'subagent')] })
+    await clock.advance(5000)
+    expect((await onAir($)).length).toBeGreaterThan(0)
+    await $.classic.SubagentStop({ stop_hook_active: false, agent_id: 'a1', agent_transcript_path: '/x', agent_type: 'Explore', background_tasks: [bgTask('a1', 'subagent')] })
+    await clock.advance(15_000)
+    expect(await onAir($)).toHaveLength(0)
+  })
+
+  test('動きのないまま 30 分たったら待つのをやめる', { timeoutMs: 60_000 }, async ($, on) => {
+    const clock = setup(on)
+    await $.classic.Stop({ stop_hook_active: false, background_tasks: [bgTask('b1', 'shell', 'npm run build')] })
+    await clock.advance(29 * 60_000)
+    expect((await onAir($)).length).toBeGreaterThan(0)
+    await clock.advance(2 * 60_000)
+    expect(await onAir($)).toHaveLength(0)
+  })
+
+  test('オフのときは裏の作業を待っていても流さず、帯も出さない', async ($, on) => {
+    const clock = setup(on)
+    await runCommand($, 'off')
+    await $.classic.Stop({ stop_hook_active: false, background_tasks: [bgTask('b1', 'shell', 'npm run build')] })
+    await clock.advance(10_000)
+    expect(await onAir($)).toHaveLength(0)
+    for (const surface of SURFACES) {
+      const ui = await $.ui.mount({ ...band(false), surface })
+      expect(await ui.find({ type: 'Client' })).toBeUndefined()
+      await ui.unmount()
+    }
+  })
+
+  test('知らない id の知らせでは、ほかの作業を待ち続ける', async ($, on) => {
+    const clock = setup(on)
+    await $.classic.Stop({ stop_hook_active: false, background_tasks: [bgTask('b1', 'shell', 'npm run build')] })
+    await $.prompt.submit({ text: notice('zzz', 'completed'), origin: { kind: 'task-notification' }, wait: false })
+    await clock.advance(20_000)
+    expect((await onAir($)).length).toBeGreaterThan(0)
+  })
+
+  test('裏に何もないとき、エンジンの分身（メモリ）のツール呼び出しでは裏モードにならない', async ($, on) => {
+    const clock = setup(on)
+    await $.turn.start({ text: 'x', turnId: 't1' })
+    await endTurn($)
+    await $.classic.Stop({ stop_hook_active: false, background_tasks: [] })
+    await $.tool.call({ tool: 'Write', file_path: '/home/u/.claude/memory/MEMORY.md', content: 'x', agentId: 'mem-fork' })
+    await clock.advance(20_000)
+    expect(await onAir($)).toHaveLength(0)
+  })
+
+  test('裏のサブエージェントが終わって知らせのターンも終われば、すぐ止まる', async ($, on) => {
+    const clock = setup(on)
+    await $.turn.start({ text: 'x', turnId: 't1' })
+    await endTurn($)
+    await $.classic.Stop({ stop_hook_active: false, background_tasks: [bgTask('a1', 'subagent')] })
+    await clock.advance(5000)
+    await $.tool.call({ tool: 'Read', file_path: '/a.ts', agentId: 'a1' })
+    await $.classic.SubagentStop({ stop_hook_active: false, agent_id: 'a1', agent_transcript_path: '/x', agent_type: 'Explore', background_tasks: [] })
+    await $.prompt.submit({ text: notice('a1', 'completed'), origin: { kind: 'task-notification' }, wait: false })
+    await $.turn.start({ text: 'n', turnId: 't2' })
+    await clock.advance(3000)
+    await endTurn($, 't2')
+    await $.classic.Stop({ stop_hook_active: false, background_tasks: [] })
+    await clock.advance(8000)
+    const fresh = freshOnAir($)
+    await fresh()
+    await clock.advance(10_000)
+    expect(await fresh()).toEqual([])
+  })
+
+  test('ワークフローが一覧にあれば、分身の動きで 30 分を延ばす', { timeoutMs: 60_000 }, async ($, on) => {
+    const clock = setup(on)
+    await $.turn.start({ text: 'x', turnId: 't1' })
+    await endTurn($)
+    await $.classic.Stop({ stop_hook_active: false, background_tasks: [bgTask('w1', 'workflow')] })
+    await clock.advance(25 * 60_000)
+    await $.tool.call({ tool: 'Read', file_path: '/a.ts', agentId: 'wf-agent' })
+    await clock.advance(10 * 60_000)
+    expect((await onAir($)).length).toBeGreaterThan(0)
+  })
+
+  test('一覧に載り続けるだけの作業（拾えなかった開発サーバーなど）では、待つ時間を延ばさない', { timeoutMs: 60_000 }, async ($, on) => {
+    const clock = setup(on)
+    await $.classic.Stop({ stop_hook_active: false, background_tasks: [bgTask('s1', 'shell', 'go run ./cmd/api')] })
+    await clock.advance(31 * 60_000)
+    expect(await onAir($)).toHaveLength(0)
+    await $.turn.start({ text: 'x', turnId: 't2' })
+    await endTurn($, 't2')
+    await $.classic.Stop({ stop_hook_active: false, background_tasks: [bgTask('s1', 'shell', 'go run ./cmd/api')] })
+    await clock.advance(20_000)
+    expect(await onAir($)).toHaveLength(0)
   })
 })
