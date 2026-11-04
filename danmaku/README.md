@@ -18,16 +18,51 @@ Claude が作業している間、プロンプトの上にニコニコ動画み�
 - 作業中と、裏の作業を待っている間と、コメントが流れている間だけ帯が出ます。終わって数秒でたたまれます
 - ターミナルで動作確認済み。Desktop の Code タブも描画に対応しています（テストのみで確認、実機は未確認）
 
-## 使い方
+## 入れ方
+
+### GitHub から入れる（ふつうに使うならこれ）
 
 ```sh
-# このフォルダを読み込んで起動
-claude --plugin-dir ./danmaku
-
-# マーケットプレイス（このリポジトリ）から入れる場合
-claude plugin marketplace add /path/to/claude-mod
+claude plugin marketplace add Akatsuki1910/claude-mod
 claude plugin install danmaku@my-mods
 ```
+
+- ユーザー全体に入るので、どのプロジェクトでも、ターミナルの `claude` でも Claude Desktop の Code タブでも流れます
+- 設定を変える: `/plugin configure danmaku@my-mods`（入れるときに `--config density=high` のように渡しても可）
+- 新しい版にする: `claude plugin marketplace update my-mods` のあと `claude plugin update danmaku@my-mods`（`plugin.json` の `version` が上がっているときに入ります）
+- 外す: `claude plugin uninstall danmaku@my-mods`
+
+### 手元のフォルダを読み込む（改造しながら使うなら）
+
+その場だけ読み込む:
+
+```sh
+claude --plugin-dir ./danmaku
+```
+
+いつも読み込む（Desktop の Code タブにも効きます）には、`~/.claude/settings.json` に書きます。`CLAUDE_CODE_PLUGIN_DIR_WATCH` を付けると、ファイルを書き換えたらすぐ反映されます:
+
+```json
+{
+  "env": {
+    "CLAUDE_CODE_PLUGIN_DIRS": "/path/to/claude-mod/danmaku",
+    "CLAUDE_CODE_PLUGIN_DIR_WATCH": "1"
+  }
+}
+```
+
+GitHub から入れた danmaku と一緒に使うと二重に読み込まれるので、どちらか一方にしてください。
+
+### 流れる場所
+
+| 場所 | 弾幕 |
+| --- | --- |
+| ターミナルの `claude` | 流れる |
+| Claude Desktop の Code タブ | 流れる |
+| Claude Desktop のふつうのチャット | 流れない（Claude Code のプラグインは読み込まれません） |
+| VS Code 拡張・Web・スマホ | 流れない（弾幕を描く部品がありません） |
+
+## 使い方
 
 起動したら `/danmaku demo` で試し流しができます。
 
@@ -104,6 +139,8 @@ danmaku/
 - `Unknown command: /danmaku` と出る: mod が読み込まれていません。`claude --debug-file /tmp/cc.log --plugin-dir ./danmaku` で起動して、`/tmp/cc.log` の `hooks module danmaku` の行に理由が出ます
 - Claude Code 2.1.285〜2.1.289 で動作確認しています。2.1.286 以前は mod が早期アクセスなので、読み込まれない場合は `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1` を付けて起動するか、`claude update` で 2.1.287 以降にしてください
 - ほかの mod も帯（プロンプトの上）に描いている場合、先に読み込まれた方が帯を丸ごと置き換えることがあります。`--plugin-dir ./danmaku` を先に書くと両方出ます
+- ターンのあと裏の作業を待つ弾幕が出ない／`/clear` のあとオフが戻る: ほかのプラグインが `classic.Stop` や `classic.SessionStart` のフックを先に処理して止めていると、danmaku のフックまで届きません（デバッグログに `hook was skipped` と出ます）
+- 弾幕が二重に流れる: GitHub から入れた danmaku と、`--plugin-dir` や `CLAUDE_CODE_PLUGIN_DIRS` で読み込んだ danmaku が両方動いています。どちらか一方にしてください
 
 ## 開発
 
